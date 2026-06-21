@@ -32,7 +32,7 @@ def calculate_ema(closes, period):
     for price in closes[period:]: ema = (price - ema) * multiplier + ema
     return ema
 
-# === BATCH SECTOR DATA - FIXES RATE LIMITING ===
+# === BATCH SECTOR DATA - NO RATE LIMITS ===
 def get_binance_24hr_batch():
     symbols = ["BTCUSDT","ETHUSDT","FETUSDT","AGIXUSDT","OCEANUSDT","RNDRUSDT","ONDOUSDT","POLYXUSDT","CFGUSDT","AAVEUSDT","UNIUSDT","MKRUSDT","COMPUSDT","XRPUSDT","XLMUSDT","ALGOUSDT"]
     try:
@@ -110,7 +110,7 @@ def run_scanner():
     CACHE["scans"] += 1
     update_sectors()
 
-# === TELEGRAM COMMANDS - ALL FIXES APPLIED ===
+# === TELEGRAM COMMANDS ===
 @bot.message_handler(commands=['start'])
 def start(message):
     run_scanner()
@@ -189,7 +189,7 @@ def stats(message):
 {sectors_str}"""
     bot.send_message(message.chat.id, msg, parse_mode='HTML')
 
-# === CAP ENDPOINT ===
+# === CAP ENDPOINT FOR RENDER ===
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
