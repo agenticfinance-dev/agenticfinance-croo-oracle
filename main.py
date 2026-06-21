@@ -13,8 +13,8 @@ app = FastAPI()
 # ===== CONFIG =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-CHAT_ID = os.environ.get("CHAT_ID") # Your ID for ALPHA alerts
-PREMIUM_CHAT_IDS = os.environ.get("PREMIUM_CHAT_IDS", "").split(",") # Paid users: "123,456,789"
+CHAT_ID = os.environ.get("CHAT_ID")
+PREMIUM_CHAT_IDS = [x.strip() for x in os.environ.get("PREMIUM_CHAT_IDS", "").split(",") if x.strip()]
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 start_time = time.time()
@@ -27,7 +27,8 @@ ASSETS = [
 # ===== STATE =====
 cache = {"signals": {}, "last_scan": 0}
 signal_history = []
-last_alerted = {}
+last_alerted = {"free": {}, "premium": {}}
+croo_call_count = 0  # Track CROO revenue
 
 # ===== HELPERS =====
 def get_binance_klines(symbol, interval="1h", limit=100):
@@ -120,7 +121,7 @@ def analyze_asset(symbol, timeframe="1h"):
             "reasons": ["No OHLCV Data"], "ema20": 0, "ema50": 0, 
             "pullback_pct": 0, "bounce_pct": 0, "source": "price_only", 
             "entry": 0, "stop_loss": 0, "take_profit": 0, "status": "na",
-            "pnl": 0, "timestamp": datetime.utcnow().isoformat()
+            "pnl": 0, "tier": "NONE", "timestamp": datetime.utcnow().isoformat()
         }
     
     closes = np.array([float(k[4]) for k in klines])
@@ -175,7 +176,7 @@ def analyze_asset(symbol, timeframe="1h"):
         short_score += 25
         short_reasons.append("Vol Spike")
     
-    # ===== DECIDE DIRECTION & SIGNAL =====
+    # ===== DECIDE DIRECTION & TIER =====
     if long_score >= short_score:
         confidence = long_score
         direction = "LONG"
@@ -183,18 +184,22 @@ def analyze_asset(symbol, timeframe="1h"):
         
         if confidence >= 75:
             signal = "ALPHA_LONG"
+            tier = "PREMIUM"
             stop_loss = round(price * 0.97, 4)
             take_profit = round(price * 1.09, 4)
         elif confidence >= 60:
             signal = "BUY"
+            tier = "FREE"
             stop_loss = round(price * 0.96, 4)
             take_profit = round(price * 1.08, 4)
         elif confidence >= 45:
             signal = "WATCH_LONG"
+            tier = "NONE"
             stop_loss = 0
             take_profit = 0
         else:
             signal = "NONE"
+            tier = "NONE"
             stop_loss = 0
             take_profit = 0
     else:
@@ -204,18 +209,22 @@ def analyze_asset(symbol, timeframe="1h"):
         
         if confidence >= 75:
             signal = "ALPHA_SHORT"
+            tier = "PREMIUM"
             stop_loss = round(price * 1.03, 4)
             take_profit = round(price * 0.91, 4)
         elif confidence >= 60:
             signal = "SHORT"
+            tier = "FREE"
             stop_loss = round(price * 1.04, 4)
             take_profit = round(price * 0.92, 4)
         elif confidence >= 45:
             signal = "WATCH_SHORT"
+            tier = "NONE"
             stop_loss = 0
             take_profit = 0
         else:
             signal = "NONE"
+            tier = "NONE"
             stop_loss = 0
             take_profit = 0
     
@@ -230,12 +239,13 @@ def analyze_asset(symbol, timeframe="1h"):
         "confidence": confidence,
         "signal": signal,
         "direction": direction,
+        "tier": tier,
         "entry": round(price, 4) if signal not in ["NONE", "WATCH_LONG", "WATCH_SHORT"] else 0,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "reasons": reasons,
         "source": source,
-        "status": "open" if signal in ["ALPHA_LONG", "ALPHA_SHORT", "BUY", "SHORT"] else "na",
+        "status": "open" if signal not in ["NONE", "WATCH_LONG", "WATCH_SHORT"] else "na",
         "pnl": 0,
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -272,11 +282,14 @@ def run_scanner():
         if data:
             results[asset] = data
             
-            if data["signal"] in ["ALPHA_LONG", "ALPHA_SHORT"] and asset not in last_alerted and bot:
+            if data["tier"] == "PREMIUM" and f"{asset}_premium" not in last_alerted["premium"] and bot:
                 asyncio.create_task(send_alpha_alert(asset, data))
-                last_alerted[asset] = time.time()
+                last_alerted["premium"][f"{asset}_premium"] = time.time()
             
-            if data["signal"] not in ["NONE"]:
+            if data["tier"] == "FREE" and f"{asset}_free" not in last_alerted["free"]:
+                last_alerted["free"][f"{asset}_free"] = time.time()
+            
+            if data["signal"]!= "NONE":
                 signal_history.append(data)
     
     signal_history = signal_history[-100:]
@@ -291,7 +304,7 @@ async def send_alpha_alert(asset, data):
     direction_emoji = "🚀" if data["direction"] == "LONG" else "🔻"
     msg = f"{direction_emoji} ALPHA {data['direction']}: {asset.replace('USDT','')}\n"
     msg += f"Entry: ${data['entry']}\nSL: ${data['stop_loss']}\nTP: ${data['take_profit']}\n"
-    msg += f"Conf: {data['confidence']}/100\nReasons: {', '.join(data['reasons'])}"
+    msg += f"Conf: {data['confidence']}/100 | R:R 1:3\nReasons: {', '.join(data['reasons'])}"
     
     if CHAT_ID:
         try:
@@ -300,9 +313,9 @@ async def send_alpha_alert(asset, data):
             pass
     
     for premium_id in PREMIUM_CHAT_IDS:
-        if premium_id.strip():
+        if premium_id:
             try:
-                await bot.send_message(chat_id=premium_id.strip(), text=msg)
+                await bot.send_message(chat_id=premium_id, text=msg)
             except:
                 pass
 
@@ -331,8 +344,8 @@ async def webhook(request: Request):
 async def handle_message(chat_id, text):
     if text == "/start" and bot:
         keyboard = [
-            [InlineKeyboardButton("📊 Scan All", callback_data="scan_all"),
-             InlineKeyboardButton("📈 Leaderboard", callback_data="leaderboard")],
+            [InlineKeyboardButton("📊 Free Signals", callback_data="scan_free"),
+             InlineKeyboardButton("📈 Performance", callback_data="performance")],
             [InlineKeyboardButton("🔍 BTC", callback_data="BTCUSDT"),
              InlineKeyboardButton("🔍 ETH", callback_data="ETHUSDT"),
              InlineKeyboardButton("🔍 SOL", callback_data="SOLUSDT")],
@@ -342,33 +355,53 @@ async def handle_message(chat_id, text):
             [InlineKeyboardButton("🔍 TRX", callback_data="TRXUSDT"),
              InlineKeyboardButton("🔍 LINK", callback_data="LINKUSDT"),
              InlineKeyboardButton("🔍 AVAX", callback_data="AVAXUSDT")],
-            [InlineKeyboardButton("📊 Status", callback_data="status")]
+            [InlineKeyboardButton("💎 Upgrade to ALPHA - $29/mo", url="https://t.me/yourchannel")]
         ]
-        msg = "📊 CROO AI Oracle\n\nFree: BUY/SHORT signals\nPremium: ALPHA signals\n\nTap Scan All"
+        msg = "📊 CROO AI Oracle\n\nFREE: BUY/SHORT (60+ conf, 1:2 R:R)\nPREMIUM: ALPHA (75+ conf, 1:3 R:R)\n\nTap Free Signals to start"
         await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_callback(chat_id, data):
     if not bot:
         return
-    if data == "scan_all":
+    
+    if data == "scan_free":
         run_scanner()
         signals = cache["signals"]
         buys = [s for s in signals.values() if s["signal"] == "BUY"]
         shorts = [s for s in signals.values() if s["signal"] == "SHORT"]
-        watch = [s for s in signals.values() if s["signal"] in ["WATCH_LONG", "WATCH_SHORT"]]
         
         msg_parts = []
         if buys:
-            msg_parts.append("💰 BUY:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: {s['confidence']}/100\nEntry ${s['entry']} | SL ${s['stop_loss']}" for s in buys]))
+            msg_parts.append("💰 FREE BUY:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: {s['confidence']}/100\nEntry ${s['entry']} | SL ${s['stop_loss']} | TP ${s['take_profit']}" for s in buys]))
         if shorts:
-            msg_parts.append("🔻 SHORT:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: {s['confidence']}/100\nEntry ${s['entry']} | SL ${s['stop_loss']}" for s in shorts]))
-        if watch:
-            msg_parts.append("👀 WATCH:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: {s['confidence']}/100 {s['direction']}" for s in watch]))
+            msg_parts.append("🔻 FREE SHORT:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: {s['confidence']}/100\nEntry ${s['entry']} | SL ${s['stop_loss']} | TP ${s['take_profit']}" for s in shorts]))
         
         if msg_parts:
-            msg = "\n\n".join(msg_parts)
+            msg = "\n\n".join(msg_parts) + "\n\n💎 Want ALPHA signals? 75+ conf, 1:3 R:R. Upgrade above."
         else:
-            msg = "No signals. Scanned 9 coins:\n" + "\n".join([f"{k.replace('USDT','')}: {v['confidence']}/100 {v['direction']}" for k,v in signals.items()])
+            msg = "No free signals right now (need 60+ confidence).\n\nALPHA signals (75+ conf, 1:3 R:R) available to Premium.\nScanned: " + ", ".join([f"{k.replace('USDT','')}:{v['confidence']}" for k,v in signals.items()])
+        await bot.send_message(chat_id=chat_id, text=msg)
+    
+    elif data == "performance":
+        check_closed_signals()
+        closed = [s for s in signal_history if s.get("status") in ["win", "loss"]]
+        wins = [s for s in closed if s["status"] == "win"]
+        premium_closed = [s for s in closed if s.get("tier") == "PREMIUM"]
+        premium_wins = [s for s in premium_closed if s["status"] == "win"]
+        free_closed = [s for s in closed if s.get("tier") == "FREE"]
+        free_wins = [s for s in free_closed if s["status"] == "win"]
+        
+        total = len(closed)
+        win_rate = round(len(wins)/total*100, 1) if total else 0
+        premium_wr = round(len(premium_wins)/len(premium_closed)*100, 1) if premium_closed else 0
+        free_wr = round(len(free_wins)/len(free_closed)*100, 1) if free_closed else 0
+        
+        msg = f"📈 Performance\n"
+        msg += f"Overall: {win_rate}% ({len(wins)}/{total})\n"
+        msg += f"ALPHA (Premium): {premium_wr}% | 1:3 R:R\n"
+        msg += f"FREE: {free_wr}% | 1:2 R:R"
+        if wins:
+            msg += f"\n\nLast 3 wins:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: +{s['pnl']}% {s['direction']} ({s['tier']})" for s in wins[-3:]])
         await bot.send_message(chat_id=chat_id, text=msg)
     
     elif data in ASSETS:
@@ -377,28 +410,13 @@ async def handle_callback(chat_id, data):
         if not s:
             msg = f"Error fetching {data.replace('USDT','')}"
         elif s["signal"] == "NONE":
-            msg = f"No setup for {data.replace('USDT','')}.\nRSI: {s['rsi']} | Conf: {s['confidence']}/100\nSource: {s.get('source','unknown')}"
-        elif s["signal"] in ["ALPHA_LONG", "ALPHA_SHORT"]:
-            msg = f"🔒 {s['signal']}: {s['asset'].replace('USDT','')}\nUpgrade to Premium for entry/SL/TP"
+            msg = f"No signal for {data.replace('USDT','')}.\nRSI: {s['rsi']} | Conf: {s['confidence']}/100\nNeed 60+ for FREE, 75+ for ALPHA."
+        elif s["tier"] == "PREMIUM":
+            msg = f"🔒 {s['signal']}: {s['asset'].replace('USDT','')}\n\nALPHA signals are Premium only.\nUpgrade for Entry/SL/TP with 1:3 R:R"
         else:
             msg = f"{s['signal']}: {s['asset'].replace('USDT','')}\n"
             msg += f"Entry: ${s['entry']}\nSL: ${s['stop_loss']}\nTP: ${s['take_profit']}\n"
-            msg += f"Conf: {s['confidence']}/100 | RSI: {s['rsi']}\nReasons: {', '.join(s['reasons'])}"
-        await bot.send_message(chat_id=chat_id, text=msg)
-    
-    elif data == "status":
-        uptime = int(time.time() - start_time)
-        last = int(time.time() - cache["last_scan"]) if cache["last_scan"] else 0
-        open_signals = len([s for s in signal_history if s.get("status") == "open"])
-        msg = f"📊 CROO Oracle Status\nUptime: {uptime//3600}h {(uptime%3600)//60}m\nLast scan: {last}s ago\nOpen: {open_signals}\nTotal: {len(signal_history)}"
-        await bot.send_message(chat_id=chat_id, text=msg)
-    
-    elif data == "leaderboard":
-        wins = [s for s in signal_history if s.get("status") == "win"][-5:]
-        if not wins:
-            msg = "No closed wins yet. ALPHA signals target 70% win rate."
-        else:
-            msg = "🏆 Recent Wins:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: +{s['pnl']}% | {s['direction']}" for s in wins])
+            msg += f"Conf: {s['confidence']}/100 | RSI: {s['rsi']}\nR:R 1:2 | Tier: {s['tier']}\nReasons: {', '.join(s['reasons'])}"
         await bot.send_message(chat_id=chat_id, text=msg)
 
 @app.get("/")
@@ -412,6 +430,8 @@ def debug():
 
 @app.get("/oracle")
 def oracle(asset: str = None):
+    global croo_call_count
+    croo_call_count += 1  # CROO pays $0.01 per call
     run_scanner()
     if asset:
         return cache["signals"].get(asset.upper(), {"error": "Asset not found"})
@@ -419,6 +439,8 @@ def oracle(asset: str = None):
 
 @app.post("/oracle")
 async def oracle_post(request: Request):
+    global croo_call_count
+    croo_call_count += 1  # CROO pays $0.01 per call
     data = await request.json()
     asset = data.get("asset", "").upper()
     run_scanner()
@@ -429,15 +451,21 @@ def stats():
     check_closed_signals()
     closed = [s for s in signal_history if s.get("status") in ["win", "loss"]]
     wins = [s for s in closed if s["status"] == "win"]
+    premium_closed = [s for s in closed if s.get("tier") == "PREMIUM"]
+    premium_wins = [s for s in premium_closed if s["status"] == "win"]
     total = len(closed)
     win_rate = round(len(wins)/total*100, 1) if total else 0
+    premium_wr = round(len(premium_wins)/len(premium_closed)*100, 1) if premium_closed else 0
     avg_pnl = round(sum(s["pnl"] for s in closed)/total, 2) if total else 0
     return {
         "total_closed": total,
         "wins": len(wins),
         "losses": total - len(wins),
         "win_rate": win_rate,
+        "premium_win_rate": premium_wr,
         "avg_pnl_pct": avg_pnl,
+        "croo_api_calls": croo_call_count,
+        "croo_revenue_est": round(croo_call_count * 0.01, 2),
         "last_signal": signal_history[-1] if signal_history else None
     }
 
@@ -448,5 +476,5 @@ def cap_health():
         "status": "active",
         "assets": ASSETS,
         "uptime_seconds": int(time.time() - start_time),
-        "version": "3.0-croo"
+        "version": "6.0-croo-monetized"
     }
