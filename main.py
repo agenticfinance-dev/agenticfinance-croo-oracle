@@ -2,494 +2,315 @@ import os
 import time
 import requests
 import numpy as np
+from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from threading import Lock
-from typing import Dict, List
-from dotenv import load_dotenv
+import asyncio
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
-load_dotenv()
+app = FastAPI()
 
-app = FastAPI(title="CROO Oracle", version="2.0")
-
-# ==== CONFIG ====
+# ===== CONFIG =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-CACHE_TTL = 300
-MAIN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT"]
-SYMBOL_TO_NAME = {s: s.replace("USDT", "") for s in MAIN_SYMBOLS}
+CHAT_ID = os.environ.get("CHAT_ID") # Optional: for auto alerts to you
 
-# ==== CACHE ====
-cache = {
-    "signals": {},
-    "leaderboard": [],
-    "last_update": 0,
-    "start_time": time.time(),
-    "total_scans": 0
-}
-cache_lock = Lock()
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+start_time = time.time()
 
-# ==== SET WEBHOOK ON STARTUP ====
-@app.on_event("startup")
-async def startup_event():
-    if TELEGRAM_BOT_TOKEN and RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        try:
-            r = requests.post(f"{TELEGRAM_API_URL}/setWebhook", json={"url": webhook_url}, timeout=5)
-            print(f"Webhook set: {r.json()}")
-        except Exception as e:
-            print(f"Webhook failed: {e}")
-    run_scanner()
+# Expanded for hackathon demo
+ASSETS = [
+    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT",
+    "DOGEUSDT","ADAUSDT","TRXUSDT","LINKUSDT","AVAXUSDT"
+]
 
-# ==== HEALTH CHECK ====
-@app.get("/health")
-@app.head("/health")
-def health():
-    return {
-        "status": "ok",
-        "agent": "CROO Oracle",
-        "assets": list(SYMBOL_TO_NAME.values()),
-        "timestamp": int(time.time())
-    }
+TIMEFRAMES = ["15m", "1h", "4h"]
 
-# ==== TA HELPERS ====
-def calculate_rsi(closes: List[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1 + rs))
+# ===== STATE =====
+cache = {"signals": {}, "last_scan": 0}
+signal_history = [] # Last 50 signals
+last_alerted = {} # Prevent spam: {asset: timestamp}
 
-def calculate_ema(closes: List[float], period: int) -> float:
-    if len(closes) < period:
-        return closes[-1] if closes else 0
-    weights = np.exp(np.linspace(-1.0, 0.0, period))
-    weights /= weights.sum()
-    return np.convolve(closes, weights, mode='valid')[-1]
-
-# ==== BINANCE KLINES ====
-def get_klines(symbol: str, interval: str = "1h", limit: int = 100) -> Dict:
+# ===== HELPERS =====
+def get_binance_klines(symbol, interval="1h", limit=100):
     try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=5
-        )
-        if r.status_code!= 200:
-            return None
-        data = r.json()
-        return {
-            "closes": [float(x[4]) for x in data],
-            "volumes": [float(x[5]) for x in data],
-            "highs": [float(x[2]) for x in data],
-            "lows": [float(x[3]) for x in data]
-        }
-    except Exception as e:
-        print(f"Binance klines failed for {symbol}: {e}")
+        url = f"https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, timeout=5)
+        return r.json()
+    except:
         return None
 
-# ==== BINANCE 24HR TICKER ====
-def get_binance_24hr(symbol: str) -> float:
+def get_mexc_klines(symbol, interval="1h", limit=100):
+    try:
+        url = f"https://api.mexc.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, timeout=5)
+        return r.json()
+    except:
+        return None
+
+def get_coingecko_price(asset):
+    mapping = {
+        "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
+        "SOLUSDT": "solana", "DOGEUSDT": "dogecoin", "ADAUSDT": "cardano",
+        "TRXUSDT": "tron", "LINKUSDT": "chainlink", "AVAXUSDT": "avalanche-2"
+    }
     try:
         r = requests.get(
-            "https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": symbol},
-            timeout=3
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": mapping[asset], "vs_currencies": "usd"},
+            timeout=5
         )
-        if r.status_code == 200:
-            return float(r.json()["priceChangePercent"])
+        return float(r.json()[mapping[asset]]["usd"])
     except:
-        pass
-    return 0.0
+        return None
 
-# ==== MEXC FALLBACK ====
-def get_mexc_24hr(symbol: str) -> float:
-    try:
-        r = requests.get(
-            "https://api.mexc.com/api/v3/ticker/24hr",
-            params={"symbol": symbol},
-            timeout=3
-        )
-        if r.status_code == 200:
-            return float(r.json()["priceChangePercent"])
-    except:
-        pass
-    return 0.0
+def calc_rsi(closes, period=14):
+    deltas = np.diff(closes)
+    seed = deltas[:period]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down!= 0 else 0
+    rsi = np.zeros_like(closes)
+    rsi[:period] = 100. - 100. / (1. + rs)
+    
+    for i in range(period, len(closes)):
+        delta = deltas[i - 1]
+        if delta > 0:
+            upval = delta
+            downval = 0.
+        else:
+            upval = 0.
+            downval = -delta
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down!= 0 else 0
+        rsi[i] = 100. - 100. / (1. + rs)
+    return rsi
 
-def get_24hr_change(symbol: str) -> float:
-    change = get_binance_24hr(symbol)
-    if change!= 0.0:
-        return change
-    return get_mexc_24hr(symbol)
+def calc_ema(closes, period):
+    return np.convolve(closes, np.ones(period)/period, mode='valid')
 
-# ==== PULLBACK ENGINE ====
-def analyze_pullback(symbol: str) -> Dict:
-    klines = get_klines(symbol, "1h", 100)
+def analyze_asset(symbol, timeframe="1h"):
+    # Try Binance -> MEXC -> CoinGecko price only
+    klines = get_binance_klines(symbol, timeframe)
     if not klines:
-        return {
-            "symbol": symbol.replace("USDT", ""),
-            "price": 0,
-            "signal": "NONE",
-            "confidence": 0,
-            "entry_zone": "N/A",
-            "tp": 0,
-            "sl": 0,
-            "rsi": 50,
-            "reasons": ["❌ API Error"],
-            "pullback_pct": 0,
-            "rrr": 0,
-            "change_24h": 0,
-            "ema50": 0
-        }
+        klines = get_mexc_klines(symbol, timeframe)
     
-    closes = klines["closes"]
-    volumes = klines["volumes"]
-    highs = klines["highs"]
+    if not klines or len(klines) < 50:
+        price = get_coingecko_price(symbol)
+        if not price:
+            return None
+        return {"price": price, "confidence": 0, "signal": "NONE", "timeframe": timeframe}
     
+    closes = np.array([float(k[4]) for k in klines])
+    volumes = np.array([float(k[5]) for k in klines])
     price = closes[-1]
-    rsi = calculate_rsi(closes)
-    ema20 = calculate_ema(closes, 20)
-    ema50 = calculate_ema(closes, 50)
     
-    recent_high = max(highs[-24:]) if len(highs) >= 24 else max(highs)
-    pullback_pct = ((recent_high - price) / recent_high) * 100 if recent_high > 0 else 0
+    rsi = calc_rsi(closes)[-1]
+    ema20 = calc_ema(closes, 20)[-1]
+    ema50 = calc_ema(closes, 50)[-1]
     
-    avg_vol = np.mean(volumes[-20:]) if len(volumes) >= 20 else np.mean(volumes)
-    vol_spike = volumes[-1] > avg_vol * 1.2 if avg_vol > 0 else False
+    # Pullback % from recent high
+    recent_high = max(closes[-20:])
+    pullback = (recent_high - price) / recent_high * 100
     
-    change_24h = get_24hr_change(symbol)
+    # Volume spike
+    avg_vol = np.mean(volumes[-20:])
+    vol_spike = volumes[-1] > avg_vol * 1.5
     
-    # ==== CONFIDENCE SCORING ====
+    # Confidence scoring
     confidence = 0
     reasons = []
     
     if rsi < 40:
         confidence += 25
-        reasons.append(f"├── RSI Oversold: +25% ({round(rsi, 1)})")
-    elif rsi < 50:
-        confidence += 10
-        reasons.append(f"├── RSI Cooling: +10% ({round(rsi, 1)})")
-    
+        reasons.append("RSI Oversold")
     if price > ema50:
         confidence += 25
-        reasons.append(f"├── Above EMA50: +25% (${round(ema50, 2)})")
-    
-    if 3 <= pullback_pct <= 10:
+        reasons.append("Above EMA50")
+    if 3 < pullback < 10:
         confidence += 25
-        reasons.append(f"├── Healthy Pullback: +25% ({round(pullback_pct, 1)}%)")
-    elif 1 <= pullback_pct < 3:
-        confidence += 10
-        reasons.append(f"├── Shallow Pullback: +10% ({round(pullback_pct, 1)}%)")
-    
+        reasons.append("Healthy Pullback")
     if vol_spike:
         confidence += 25
-        reasons.append(f"└── Volume Spike: +25% ({round(volumes[-1]/avg_vol, 1)}x)")
+        reasons.append("Volume Spike")
     
-    if confidence >= 75:
+    # New WATCH tier
+    if confidence >= 60:
         signal = "BUY"
-    elif confidence >= 50:
+    elif confidence >= 35:
         signal = "WATCH"
     else:
         signal = "NONE"
     
-    # ==== ENTRY/TP/SL CALC ====
-    entry_low = round(price * 0.995, 2)
-    entry_high = round(price * 1.005, 2)
-    tp = round(price * 1.045, 2)
-    sl = round(ema50 * 0.98, 2) if ema50 > 0 else round(price * 0.96, 2)
-    
-    risk = price - sl if price > sl else 1
-    reward = tp - price
-    rrr = round(reward / risk, 2) if risk > 0 else 0
-    
     return {
-        "symbol": symbol.replace("USDT", ""),
-        "price": round(price, 2),
-        "change_24h": round(change_24h, 2),
-        "signal": signal,
-        "confidence": confidence,
-        "entry_zone": f"${entry_low} - ${entry_high}",
-        "tp": tp,
-        "sl": sl,
+        "asset": symbol,
+        "price": round(price, 4),
         "rsi": round(rsi, 1),
-        "pullback_pct": round(pullback_pct, 1),
-        "rrr": rrr,
-        "reasons": reasons if reasons else ["❌ No confluence"],
-        "ema50": round(ema50, 2)
+        "ema20": round(ema20, 4),
+        "ema50": round(ema50, 4),
+        "pullback_pct": round(pullback, 2),
+        "confidence": confidence,
+        "signal": signal,
+        "reasons": reasons,
+        "timeframe": timeframe,
+        "timestamp": datetime.utcnow().isoformat()
     }
 
-# ==== RUN SCANNER ====
 def run_scanner():
-    now = time.time()
+    results = {}
+    for asset in ASSETS:
+        data = analyze_asset(asset, "1h")
+        if data:
+            results[asset] = data
+            
+            # Auto alert logic
+            if data["confidence"] >= 75 and asset not in last_alerted:
+                asyncio.create_task(send_auto_alert(asset, data))
+                last_alerted[asset] = time.time()
+            
+            # Save to history if BUY or WATCH
+            if data["signal"] in ["BUY", "WATCH"]:
+                signal_history.append(data)
     
-    with cache_lock:
-        if now - cache["last_update"] < CACHE_TTL:
-            return cache
+    # Keep only last 50
+    global signal_history
+    signal_history = signal_history[-50:]
     
-    signals = {}
-    for symbol in MAIN_SYMBOLS:
-        signals[symbol] = analyze_pullback(symbol)
-        time.sleep(0.1)
-    
-    leaderboard = sorted(
-        [s for s in signals.values() if s["signal"]!= "NONE"],
-        key=lambda x: x["confidence"],
-        reverse=True
-    )
-    
-    with cache_lock:
-        cache["signals"] = signals
-        cache["leaderboard"] = leaderboard
-        cache["last_update"] = now
-        cache["total_scans"] += 1
-    
-    print(f"Scanner complete. {len(leaderboard)} signals found.")
-    return cache
+    cache["signals"] = results
+    cache["last_scan"] = time.time()
+    return results
 
-# ==== CAP ENDPOINT - CROO AGENT API ====
-@app.post("/oracle")
-async def oracle_api(req: Request):
+async def send_auto_alert(asset, data):
+    if not CHAT_ID:
+        return
+    msg = f"🚨 AUTO ALERT: {asset}\n"
+    msg += f"Confidence: {data['confidence']}/100\n"
+    msg += f"Price: ${data['price']}\n"
+    msg += f"Reasons: {', '.join(data['reasons'])}"
     try:
-        data = await req.json()
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
     except:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    
-    asset = data.get("asset", "").upper()
-    symbol = f"{asset}USDT"
-    
-    if symbol not in MAIN_SYMBOLS:
-        return JSONResponse({
-            "error": f"Asset not supported. Use: {list(SYMBOL_TO_NAME.values())}"
-        }, status_code=400)
-    
+        pass
+
+# ===== ROUTES =====
+@app.on_event("startup")
+async def startup_event():
+    if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        await bot.set_webhook(url=webhook_url)
+        print(f"Webhook set: {webhook_url}")
     run_scanner()
-    signal = cache["signals"].get(symbol, {})
-    
-    if not signal or signal["signal"] == "NONE":
-        return JSONResponse({
-            "signal": "NONE",
-            "confidence": 0,
-            "message": f"No high-confidence pullback for {asset} right now"
-        })
-    
-    return JSONResponse({
-        "asset": signal["symbol"],
-        "price": signal["price"],
-        "signal": signal["signal"],
-        "confidence": signal["confidence"],
-        "entry_zone": signal["entry_zone"],
-        "tp": signal["tp"],
-        "sl": signal["sl"],
-        "rsi": signal["rsi"],
-        "pullback_pct": signal["pullback_pct"],
-        "rrr": signal["rrr"],
-        "reasons": signal["reasons"]
-    })
 
-@app.get("/oracle")
-async def oracle_api_get(asset: str = "BTC"):
-    symbol = f"{asset.upper()}USDT"
-    if symbol not in MAIN_SYMBOLS:
-        return JSONResponse({
-            "error": f"Asset not supported. Use: {list(SYMBOL_TO_NAME.values())}"
-        }, status_code=400)
-    
-    run_scanner()
-    signal = cache["signals"].get(symbol, {})
-    
-    if not signal or signal["signal"] == "NONE":
-        return JSONResponse({
-            "signal": "NONE",
-            "confidence": 0,
-            "message": f"No high-confidence pullback for {asset} right now"
-        })
-    
-    return JSONResponse({
-        "asset": signal["symbol"],
-        "price": signal["price"],
-        "signal": signal["signal"],
-        "confidence": signal["confidence"],
-        "entry_zone": signal["entry_zone"],
-        "tp": signal["tp"],
-        "sl": signal["sl"],
-        "rsi": signal["rsi"],
-        "pullback_pct": signal["pullback_pct"],
-        "rrr": signal["rrr"],
-        "reasons": signal["reasons"]
-    })
-
-# ==== TELEGRAM HELPERS ====
-def send_message(chat_id, text, reply_markup=None):
-    url = f"{TELEGRAM_API_URL}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Telegram error: {e}")
-
-def get_main_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "📊 Scan All"}, {"text": "📈 Leaderboard"}],
-            [{"text": "🔍 BTC"}, {"text": "🔍 ETH"}],
-            [{"text": "🔍 XRP"}, {"text": "🔍 SOL"}],
-            [{"text": "📊 Status"}]
-        ],
-        "resize_keyboard": True
-    }
-
-def format_uptime():
-    seconds = int(time.time() - cache["start_time"])
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    return f"{hours}h {minutes}m {secs}s"
-
-# ==== TELEGRAM WEBHOOK ====
 @app.post("/webhook")
-async def telegram_webhook(req: Request):
-    try:
-        data = await req.json()
-    except:
-        return {"ok": True}
-    
-    if "message" not in data:
-        return {"ok": True}
-    
-    message = data["message"]
-    chat_id = message["chat"]["id"]
-    text = message.get("text", "")
-    
+async def webhook(request: Request):
+    data = await request.json()
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "")
+        await handle_message(chat_id, text)
+    elif "callback_query" in data:
+        query = data["callback_query"]
+        chat_id = query["message"]["chat"]["id"]
+        data_btn = query["data"]
+        await handle_callback(chat_id, data_btn)
+    return JSONResponse({"ok": True})
+
+async def handle_message(chat_id, text):
     if text == "/start":
-        run_scanner()
-        msg = """🚀 <b>CROO Oracle</b>
-AI-powered pullback signals for BTC/ETH/XRP/SOL.
+        keyboard = [
+            [InlineKeyboardButton("📊 Scan All", callback_data="scan_all"),
+             InlineKeyboardButton("📈 Leaderboard", callback_data="leaderboard")],
+            [InlineKeyboardButton("🔍 BTC", callback_data="BTCUSDT"),
+             InlineKeyboardButton("🔍 ETH", callback_data="ETHUSDT")],
+            [InlineKeyboardButton("🔍 XRP", callback_data="XRPUSDT"),
+             InlineKeyboardButton("🔍 SOL", callback_data="SOLUSDT")],
+            [InlineKeyboardButton("📊 Status", callback_data="status")]
+        ]
+        msg = "📊 Pullback Scan Results\n\nNo high-confidence pullbacks right now.\nMarket scanning continues 24/7."
+        await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
-<b>Quick Commands:</b>
-📊 Scan All — Get all signals
-📈 Leaderboard — Rank by confidence
-🔍 BTC — Deep dive on specific asset
-📊 Status — Scanner health
-
-<i>Not financial advice. Always DYOR.</i>"""
-        send_message(chat_id, msg, get_main_keyboard())
-    
-    elif text == "📊 Scan All":
+async def handle_callback(chat_id, data):
+    if data == "scan_all":
         run_scanner()
         signals = cache["signals"]
+        buys = [s for s in signals.values() if s["signal"] == "BUY"]
+        watch = [s for s in signals.values() if s["signal"] == "WATCH"]
         
-        msg = "📊 <b>Pullback Scan Results</b>\n\n"
-        found = False
-        
-        for symbol, s in signals.items():
-            if s["signal"]!= "NONE" and s["price"] > 0:
-                found = True
-                emoji = "🟢" if s["signal"] == "BUY" else "🟡"
-                msg += f"{emoji} <b>{s['symbol']}</b>: {s['signal']} ({s['confidence']}%)\n"
-                msg += f" Price: ${s['price']} | RSI: {s['rsi']}\n"
-                msg += f" Pullback: {s['pullback_pct']}% | R:R {s['rrr']}:1\n\n"
-        
-        if not found:
-            msg += "🔍 No high-confidence pullbacks right now.\nMarket scanning continues 24/7."
-        
-        send_message(chat_id, msg)
+        if buys:
+            msg = "🚨 BUY SIGNALS:\n" + "\n".join([f"{s['asset']}: {s['confidence']}/100" for s in buys])
+        elif watch:
+            msg = "👀 WATCH LIST:\n" + "\n".join([f"{s['asset']}: {s['confidence']}/100" for s in watch])
+        else:
+            msg = "No high-confidence pullbacks right now."
+        await bot.send_message(chat_id=chat_id, text=msg)
     
-    elif text == "📈 Leaderboard":
+    elif data in ASSETS:
         run_scanner()
-        leaderboard = cache["leaderboard"]
-        
-        if not leaderboard:
-            send_message(chat_id, "📈 No signals yet. Keep watching!")
-            return {"ok": True}
-        
-        msg = "🏆 <b>Signal Leaderboard</b>\n\n"
-        for i, s in enumerate(leaderboard[:4], 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "4️⃣"
-            msg += f"{medal} <b>{s['symbol']}</b> — {s['confidence']}% {s['signal']}\n"
-            msg += f" ${s['price']} | Pullback: {s['pullback_pct']}%\n"
-            msg += f" R:R {s['rrr']}:1 | RSI: {s['rsi']}\n\n"
-        
-        send_message(chat_id, msg)
+        s = cache["signals"].get(data)
+        if not s or s["signal"] == "NONE":
+            msg = f"No setup for {data.replace('USDT','')} right now.\nUse 📊 Scan All to refresh."
+        else:
+            msg = f"{s['signal']}: {s['asset'].replace('USDT','')}\n"
+            msg += f"Price: ${s['price']}\nConfidence: {s['confidence']}/100\n"
+            msg += f"RSI: {s['rsi']}\nReasons: {', '.join(s['reasons'])}"
+        await bot.send_message(chat_id=chat_id, text=msg)
     
-    elif text in ["🔍 BTC", "🔍 ETH", "🔍 XRP", "🔍 SOL"]:
-        asset = text.split()[1]
-        symbol = f"{asset}USDT"
-        run_scanner()
-        s = cache["signals"].get(symbol, {})
-        
-        if not s or s["signal"] == "NONE" or s["price"] == 0:
-            send_message(chat_id, f"🔍 No setup for {asset} right now.\n\nUse 📊 Scan All to refresh.")
-            return {"ok": True}
-        
-        reasons_text = "\n".join(s["reasons"])
-        msg = f"""🚨 <b>{asset} Pullback Analysis</b>
-
-💰 Price: ${s['price']}
-📊 24h Change: {s['change_24h']:+.2f}%
-
-🎯 Signal: <b>{s['signal']}</b>
-📈 Confidence: {s['confidence']}%
-
-📉 Pullback: {s['pullback_pct']}% from high
-📊 RSI: {s['rsi']}
-
-<b>Entry Zone:</b> {s['entry_zone']}
-🎯 TP: ${s['tp']}
-🛑 SL: ${s['sl']}
-📊 R:R: {s['rrr']}:1
-
-<b>Why:</b>
-{reasons_text}
-
-<i>Not financial advice. Always DYOR.</i>"""
-        send_message(chat_id, msg)
+    elif data == "status":
+        uptime = int(time.time() - start_time)
+        last = int(time.time() - cache["last_scan"]) if cache["last_scan"] else 0
+        msg = f"📊 CROO Oracle Status\nUptime: {uptime//3600}h {(uptime%3600)//60}m\nLast scan: {last}s ago\nSignals tracked: {len(signal_history)}"
+        await bot.send_message(chat_id=chat_id, text=msg)
     
-    elif text == "📊 Status":
-        run_scanner()
-        uptime = format_uptime()
-        signal_count = len([s for s in cache["signals"].values() if s["signal"]!= "NONE"])
-        
-        msg = f"""📊 <b>Scanner Status</b>
+    elif data == "leaderboard":
+        buys = [s for s in signal_history if s["signal"] == "BUY"][-5:]
+        if not buys:
+            msg = "No BUY signals yet."
+        else:
+            msg = "🏆 Recent BUY Signals:\n" + "\n".join([f"{s['asset'].replace('USDT','')}: {s['confidence']}/100 @ ${s['price']}" for s in buys])
+        await bot.send_message(chat_id=chat_id, text=msg)
 
-✅ Status: Active
-📊 Assets: BTC, ETH, XRP, SOL
-🔄 Last Scan: Just now
-📈 Signals Found: {signal_count}
-🔄 Total Scans: {cache['total_scans']}
-⏱️ Uptime: {uptime}
-
-<i>Scanning 24/7 for pullback entries</i>"""
-        send_message(chat_id, msg)
-    
-    else:
-        send_message(chat_id, "Unknown command. Use the buttons below.", get_main_keyboard())
-    
-    return {"ok": True}
-
-# ==== ROOT ====
+# ===== API ENDPOINTS =====
 @app.get("/")
 def root():
+    return {"status": "CROO Oracle Online", "uptime": int(time.time() - start_time)}
+
+@app.get("/debug")
+def debug():
+    run_scanner()
+    return cache["signals"]
+
+@app.get("/oracle")
+def oracle(asset: str = None):
+    run_scanner()
+    if asset:
+        return cache["signals"].get(asset.upper(), {"error": "Asset not found"})
+    return cache["signals"]
+
+@app.post("/oracle")
+async def oracle_post(request: Request):
+    data = await request.json()
+    asset = data.get("asset", "").upper()
+    run_scanner()
+    return cache["signals"].get(asset, {"error": "Asset not found"})
+
+@app.get("/stats")
+def stats():
+    total = len(signal_history)
+    wins = sum(1 for s in signal_history if s.get("pnl", 0) > 0)
+    return {
+        "total_signals": total,
+        "win_rate": round(wins/total*100, 1) if total else 0,
+        "last_signal": signal_history[-1] if signal_history else None
+    }
+
+@app.get("/cap/health")
+def cap_health():
     return {
         "agent": "CROO Oracle",
-        "version": "2.0",
-        "assets": list(SYMBOL_TO_NAME.values()),
-        "capabilities": ["pullback_scan", "confidence_scoring", "telegram_alerts"],
-        "api_endpoints": {
-            "post": "/oracle",
-            "get": "/oracle?asset=BTC",
-            "webhook": "/webhook"
-        }
+        "status": "active",
+        "assets": ASSETS,
+        "uptime_seconds": int(time.time() - start_time)
     }
