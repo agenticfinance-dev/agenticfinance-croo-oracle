@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import asyncio
@@ -15,20 +15,19 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-# PAYMENTS DISABLED FOR JUDGES - Flip after you win
+# PAYMENTS DISABLED FOR JUDGES
 PAYMENTS_ENABLED = False 
 PAYMENT_PROVIDER_TOKEN = ""
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 start_time = time.time()
 
-# CRO ONLY - Keeps you compliant for Croo
+# CRO ONLY
 ASSETS = ["CROUSDT"]
 
 # ===== STATE =====
 cache = {"signals": {}, "last_scan": 0}
 signal_history = []
-# Fake user DB for demo - replace with real DB later
 users_db = {}
 
 # ===== HELPERS =====
@@ -42,6 +41,18 @@ def get_binance_klines(symbol, interval="1h", limit=100):
             return r.json()
     except Exception as e:
         print(f"Binance failed for {symbol}: {e}")
+    return None
+
+def get_mexc_klines(symbol, interval="1h", limit=100):
+    try:
+        url = "https://api.mexc.com/api/v3/klines"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, headers=headers, timeout=8)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"MEXC failed for {symbol}: {e}")
     return None
 
 def get_coingecko_price(asset):
@@ -61,7 +72,10 @@ def get_current_price(symbol):
     klines = get_binance_klines(symbol, "1h", 1)
     if klines:
         return float(klines[-1][4])
-    price = get_coingecko_price(symbol)
+    klines = get_mexc_klines(symbol, "1h", 1) # MEXC fallback
+    if klines:
+        return float(klines[-1][4])
+    price = get_coingecko_price(symbol) # CoinGecko fallback
     return price if price else 0
 
 def calc_rsi(closes, period=14):
@@ -107,12 +121,17 @@ def activate_pro(user_id: int, days: int = 30):
 
 def analyze_asset(symbol, timeframe="1h"):
     klines = get_binance_klines(symbol, timeframe)
+    source = "binance"
+    if not klines:
+        klines = get_mexc_klines(symbol, timeframe) # MEXC FALLBACK
+        source = "mexc"
+    
     if not klines or len(klines) < 50:
         price = get_coingecko_price(symbol)
         return {
             "asset": symbol, "price": round(price, 4) if price else 0, 
             "confidence": 0, "signal": "NONE", "direction": "NEUTRAL", "rsi": 0, 
-            "reasons": ["No Data"], "source": "price_only", "entry": 0, 
+            "reasons": ["No OHLCV Data"], "source": "price_only", "entry": 0, 
             "stop_loss": 0, "take_profit": 0, "timestamp": datetime.utcnow().isoformat()
         }
     
@@ -134,7 +153,7 @@ def analyze_asset(symbol, timeframe="1h"):
     avg_vol = np.mean(volumes[-20:])
     vol_spike = volumes[-1] > avg_vol * 1.5 if avg_vol > 0 else False
     
-    # CRO-specific logic - lower thresholds for demo
+    # ===== LONG CONDITIONS =====
     long_score = 0
     long_reasons = []
     
@@ -142,31 +161,40 @@ def analyze_asset(symbol, timeframe="1h"):
         long_score += 30
         long_reasons.append(f"RSI {rsi:.1f}")
     if price > ema50:
-        long_score += 30
+        long_score += 25
         long_reasons.append("Above EMA50")
-    if 2 < pullback < 12:
-        long_score += 20
+    if 2 < pullback < 12: # PULLBACK KEPT
+        long_score += 25
         long_reasons.append(f"Dip {pullback:.1f}%")
     if vol_spike:
         long_score += 20
         long_reasons.append("Vol Spike")
     
+    # ===== SHORT CONDITIONS =====
     short_score = 0
     short_reasons = []
     
     if rsi > 55:
-        short_score += 30
+        short_score += 25
         short_reasons.append(f"RSI {rsi:.1f}")
     if price < ema50:
-        short_score += 30
+        short_score += 25
         short_reasons.append("Below EMA50")
-    if 2 < bounce < 12:
+    if 2 < bounce < 12: # BOUNCE KEPT
         short_score += 20
         short_reasons.append(f"Bounce {bounce:.1f}%")
+    
+    # Rally to EMA20 resistance filter for shorts
+    rally_to_resistance = ((ema20 - price) / price * 100) if price < ema20 else 0
+    if 0 < rally_to_resistance < 3:
+        short_score += 15
+        short_reasons.append(f"Rally to EMA20 {rally_to_resistance:.1f}%")
+    
     if vol_spike:
-        short_score += 20
+        short_score += 15
         short_reasons.append("Vol Spike")
     
+    # ===== DECIDE =====
     if long_score >= short_score:
         confidence = long_score
         direction = "LONG"
@@ -188,6 +216,8 @@ def analyze_asset(symbol, timeframe="1h"):
         "rsi": round(rsi, 1),
         "ema20": round(ema20, 4),
         "ema50": round(ema50, 4),
+        "pullback_pct": round(pullback, 2),
+        "bounce_pct": round(bounce, 2),
         "confidence": confidence,
         "signal": signal,
         "direction": direction,
@@ -195,6 +225,7 @@ def analyze_asset(symbol, timeframe="1h"):
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "reasons": reasons,
+        "source": source,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -226,7 +257,8 @@ async def webhook(request: Request):
     if "message" in data:
         chat_id = data["message"]["chat"]["id"]
         text = data["message"].get("text", "")
-        await handle_message(chat_id, text, data["message"]["from"]["id"])
+        user_id = data["message"]["from"]["id"]
+        await handle_message(chat_id, text, user_id)
     elif "callback_query" in data:
         query = data["callback_query"]
         chat_id = query["message"]["chat"]["id"]
@@ -241,14 +273,14 @@ async def handle_message(chat_id, text, user_id):
         
     if text == "/start":
         keyboard = [
-            [InlineKeyboardButton("📊 Get CRO Signal", callback_data="scan_cro")],
+            [InlineKeyboardButton("📊 CRO Signal", callback_data="scan_cro")],
             [InlineKeyboardButton("💰 Buy Pro", callback_data="buy_cmd"),
              InlineKeyboardButton("❌ Sell/Cancel", callback_data="sell_cmd")],
             [InlineKeyboardButton("📈 CRO Price", callback_data="price_cro")]
         ]
         msg = "🔮 CRO Oracle - Cronos Trading Bot\n\n"
         msg += "Hackathon Demo: All features FREE\n"
-        msg += "Asset: CRO only\n\n"
+        msg += "Asset: CRO only | Data: Binance + MEXC fallback\n\n"
         msg += "Commands:\n/signals - Get CRO signal\n/price - Current price\n"
         msg += "/buy - Upgrade to Pro\n/sell - Cancel subscription"
         await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -257,12 +289,12 @@ async def handle_message(chat_id, text, user_id):
         run_scanner()
         s = cache["signals"].get("CROUSDT")
         if not s or s["signal"] == "WATCH":
-            msg = f"CRO: WATCH\nPrice: ${s['price']:.4f}\nRSI: {s['rsi']}\nConf: {s['confidence']}/100\nWaiting for setup..."
+            msg = f"CRO: WATCH\nPrice: ${s['price']:.4f}\nRSI: {s['rsi']}\nConf: {s['confidence']}/100\nSource: {s['source']}"
         else:
             msg = f"{s['signal']}: CRO\n"
             msg += f"Entry: ${s['entry']}\nSL: ${s['stop_loss']}\nTP: ${s['take_profit']}\n"
             msg += f"Conf: {s['confidence']}/100 | RSI: {s['rsi']}\n"
-            msg += f"Reasons: {', '.join(s['reasons'])}"
+            msg += f"Source: {s['source']} | Reasons: {', '.join(s['reasons'])}"
         await bot.send_message(chat_id=chat_id, text=msg)
     
     elif text == "/price":
@@ -277,14 +309,12 @@ async def handle_message(chat_id, text, user_id):
 
 async def handle_buy(chat_id, user_id):
     if PAYMENTS_ENABLED:
-        # This runs AFTER Croo judging
-        await bot.send_message(chat_id=chat_id, text="Payment processing coming soon...")
+        await bot.send_message(chat_id=chat_id, text="Payment processing coming post-hackathon...")
     else:
-        # Croo Hackathon Mode
         if is_pro(user_id):
             await bot.send_message(chat_id=chat_id, text="You're already Pro ✅\n\nAll features unlocked for Croo judging.")
         else:
-            activate_pro(user_id, days=999) # Give lifetime for demo
+            activate_pro(user_id, days=999)
             await bot.send_message(
                 chat_id=chat_id, 
                 text="✅ DEMO MODE: Pro activated for Croo judges\n\n"
@@ -316,11 +346,11 @@ async def handle_callback(chat_id, data, user_id):
         run_scanner()
         s = cache["signals"].get("CROUSDT")
         if not s or s["signal"] == "WATCH":
-            msg = f"CRO: WATCH\nPrice: ${s['price']:.4f}\nRSI: {s['rsi']}\nWaiting..."
+            msg = f"CRO: WATCH\nPrice: ${s['price']:.4f}\nRSI: {s['rsi']}\nConf: {s['confidence']}/100\nSource: {s['source']}"
         else:
             msg = f"{s['signal']}: CRO\n"
             msg += f"Entry: ${s['entry']}\nSL: ${s['stop_loss']}\nTP: ${s['take_profit']}\n"
-            msg += f"Conf: {s['confidence']}/100"
+            msg += f"Conf: {s['confidence']}/100 | {', '.join(s['reasons'])}\nSource: {s['source']}"
         await bot.send_message(chat_id=chat_id, text=msg)
     
     elif data == "price_cro":
@@ -349,5 +379,7 @@ def cap_health():
         "status": "active",
         "asset": "CRO only",
         "payments": "disabled_for_judging",
-        "version": "7.0-croo-final"
+        "data_sources": ["binance", "mexc", "coingecko"],
+        "features": ["pullback", "bounce", "rally_to_ema20", "mexc_fallback", "buy", "sell"],
+        "version": "9.0-croo-final"
     }
