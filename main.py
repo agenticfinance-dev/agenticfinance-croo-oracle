@@ -149,7 +149,7 @@ async def get_price_mexc(session, coin):
 
 async def get_price_coingecko(session, coin):
     try:
-        cg_id = COIN_NAMES
+        cg_id = COIN_NAMES[coin]
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd&include_24hr_change=true"
         async with session.get(url, timeout=3) as r:
             if r.status == 200:
@@ -617,10 +617,10 @@ def main():
 
     application = (
         ApplicationBuilder()
-  .token(TOKEN)
-  .post_init(_internal_post_init)
-  .post_shutdown(post_shutdown)
-  .build()
+ .token(TOKEN)
+ .post_init(_internal_post_init)
+ .post_shutdown(post_shutdown)
+ .build()
     )
 
     application.add_handler(CommandHandler("start", start))
