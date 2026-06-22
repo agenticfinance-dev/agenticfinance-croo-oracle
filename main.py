@@ -16,25 +16,31 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHAT_ID = os.environ.get("CHAT_ID")
 
-PAYMENTS_ENABLED = False # Keep false for CROO judging
+PAYMENTS_ENABLED = False
 PAYMENT_PROVIDER_TOKEN = ""
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 start_time = time.time()
 
-# 1. MULTI-ASSET SUPPORT - CROO REQUIREMENT
 ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "CROUSDT"]
 
 # ===== STATE =====
-cache = {"signals": {}, "last_scan": 0}
+cache = {"signals": {}, "last_scan": 0, "market_regime": "neutral"}
 signal_history = []
 users_db = {}
 last_alerted = {}
-
-# 4. PERFORMANCE TRACKING
 performance = {"wins": 0, "losses": 0, "total": 0}
 
-# ===== DATA HELPERS =====
+# 7. AGENT MEMORY
+agent_memory = {
+    "last_100_signals": [],
+    "best_asset": "NONE",
+    "best_asset_win_rate": 0.0,
+    "total_calls": 0,
+    "revenue_simulated": 0.0
+}
+
+# ===== HELPERS =====
 def get_binance_klines(symbol, interval="1h", limit=100):
     try:
         url = "https://api.binance.com/api/v3/klines"
@@ -93,7 +99,14 @@ def calc_ema(closes, period):
     if len(closes) < period: return np.array([closes[-1]] if len(closes) > 0 else [0])
     return np.convolve(closes, np.ones(period)/period, mode='valid')
 
-# ===== USER MGMT =====
+# 8. CONFIDENCE GRADES
+def get_confidence_grade(confidence):
+    if confidence >= 90: return "A+"
+    elif confidence >= 80: return "A"
+    elif confidence >= 70: return "B"
+    elif confidence >= 60: return "C"
+    else: return "D"
+
 def is_pro(user_id: int) -> bool:
     user = users_db.get(user_id, {})
     if not user: return False
@@ -106,7 +119,17 @@ def activate_pro(user_id: int, days: int = 30):
     users_db[user_id]["plan"] = "pro"
     users_db[user_id]["pro_expires"] = datetime.now() + timedelta(days=days)
 
-# 6. MULTI-TIMEFRAME ANALYSIS
+# 6. MARKET REGIME DETECTION
+def detect_market_regime():
+    btc_klines = get_binance_klines("BTCUSDT", "4h", 100)
+    if not btc_klines: btc_klines = get_mexc_klines("BTCUSDT", "4h", 100)
+    if not btc_klines: return "neutral"
+    
+    closes = np.array([float(k[4]) for k in btc_klines])
+    ema50 = calc_ema(closes, 50)[-1]
+    price = closes[-1]
+    return "bullish" if price > ema50 else "bearish"
+
 def analyze_timeframe(symbol, interval):
     klines = get_binance_klines(symbol, interval)
     source = "binance"
@@ -158,7 +181,6 @@ def analyze_asset(symbol):
     if tf_1h["price"] == 0:
         return {"asset": symbol.replace("USDT", ""), "signal": "NONE", "confidence": 0}
 
-    # Weighted: 4h=50%, 1h=30%, 15m=20%
     confidence = int(tf_15m["confidence"] * 0.2 + tf_1h["confidence"] * 0.3 + tf_4h["confidence"] * 0.5)
     direction = tf_1h["direction"]
     price = tf_1h["price"]
@@ -182,10 +204,11 @@ def analyze_asset(symbol):
 
     return {
         "asset": symbol.replace("USDT", ""), "price": round(price, 4), "signal": signal,
-        "confidence": confidence, "direction": direction, "entry": round(price, 4) if signal in ["BUY", "SHORT"] else 0,
-        "stop_loss": stop_loss, "take_profit": take_profit, "rsi": round(rsi, 1), "reasons": reasons,
+        "confidence": confidence, "grade": get_confidence_grade(confidence), "direction": direction,
+        "entry": round(price, 4) if signal in ["BUY", "SHORT"] else 0, "stop_loss": stop_loss,
+        "take_profit": take_profit, "rsi": round(rsi, 1), "reasons": reasons,
         "timeframes": {"15m": tf_15m["confidence"], "1h": tf_1h["confidence"], "4h": tf_4h["confidence"]},
-        "source": tf_1h["source"], "timestamp": datetime.utcnow().isoformat()
+        "source": tf_1h["source"], "market_regime": cache["market_regime"], "timestamp": datetime.utcnow().isoformat()
     }
 
 def check_closed_signals():
@@ -207,17 +230,35 @@ def check_closed_signals():
                 elif current_price >= signal["stop_loss"]:
                     signal["pnl"] = round((signal["entry"] - signal["stop_loss"]) / signal["entry"] * 100, 2)
                     signal["status"] = "loss"; performance["losses"] += 1; performance["total"] += 1
+    update_agent_memory()
 
-# 7. AUTO TELEGRAM ALERTS
+def update_agent_memory():
+    agent_memory["last_100_signals"] = signal_history[-100:]
+    asset_stats = {}
+    for sig in signal_history:
+        if sig.get("status") in ["win", "loss"]:
+            asset = sig["asset"]
+            if asset not in asset_stats: asset_stats[asset] = {"wins": 0, "total": 0}
+            asset_stats[asset]["total"] += 1
+            if sig["status"] == "win": asset_stats[asset]["wins"] += 1
+    best = None
+    best_rate = 0
+    for asset, stats in asset_stats.items():
+        if stats["total"] >= 3:
+            rate = stats["wins"] / stats["total"]
+            if rate > best_rate:
+                best_rate = rate; best = asset
+    agent_memory["best_asset"] = best or "NONE"
+    agent_memory["best_asset_win_rate"] = round(best_rate * 100, 1)
+
 async def send_alert(signal):
     if not bot or signal["confidence"] < 75: return
     if signal["asset"] in last_alerted and time.time() - last_alerted[signal["asset"]] < 3600: return
-
     msg = f"🚨 NEW {signal['signal']} SIGNAL\n\n"
-    msg += f"Asset: {signal['asset']}\nConfidence: {signal['confidence']}%\n\n"
+    msg += f"Asset: {signal['asset']}\nConfidence: {signal['confidence']}% ({signal['grade']})\n\n"
     msg += f"Entry:\n{signal['entry']}\n\nTarget:\n{signal['take_profit']}\n\n"
     msg += f"Stop:\n{signal['stop_loss']}\n\nReasons:\n" + "\n".join(signal['reasons'])
-
+    msg += f"\n\nMarket: {signal['market_regime'].upper()}"
     if CHAT_ID:
         try: await bot.send_message(chat_id=CHAT_ID, text=msg)
         except: pass
@@ -225,6 +266,7 @@ async def send_alert(signal):
 
 def run_scanner():
     check_closed_signals()
+    cache["market_regime"] = detect_market_regime()
     results = {}
     for asset in ASSETS:
         data = analyze_asset(asset)
@@ -233,13 +275,14 @@ def run_scanner():
             if data["signal"] in ["BUY", "SHORT"]:
                 data["status"] = "open"
                 signal_history.append(data)
+                agent_memory["total_calls"] += 1
+                agent_memory["revenue_simulated"] += 0.01
                 asyncio.create_task(send_alert(data))
     signal_history[:] = signal_history[-100:]
     cache["signals"] = results
     cache["last_scan"] = time.time()
     return results
 
-# 8. SCAN SCHEDULER - Every 5 minutes
 async def scanner_loop():
     while True:
         run_scanner()
@@ -269,7 +312,6 @@ async def webhook(request: Request):
 async def handle_message(chat_id, text, user_id):
     if not bot: return
     if text == "/start":
-        # 13. BETTER MENU
         keyboard = [
             [InlineKeyboardButton("📊 Scan Markets", callback_data="scan_all"),
              InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
@@ -282,12 +324,12 @@ async def handle_message(chat_id, text, user_id):
             [InlineKeyboardButton("💎 Upgrade", callback_data="buy_cmd")]
         ]
         msg = "🔮 CROO AI Oracle - Market Intelligence\n\n"
+        msg += f"Market Regime: {cache['market_regime'].upper()}\n"
         msg += "Autonomous scanning every 5 min\n"
         msg += "Assets: BTC, ETH, SOL, XRP, CRO\n"
         msg += "Demo: All features FREE for judges\n\n"
-        msg += "/scan /best /leaderboard /buy /sell"
+        msg += "/scan /best /leaderboard /stats /buy /sell"
         await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
-
     elif text in ["/scan", "/signals"]:
         run_scanner(); await send_leaderboard(chat_id)
     elif text == "/best":
@@ -298,24 +340,37 @@ async def handle_message(chat_id, text, user_id):
         else:
             await send_rich_card(chat_id, max(signals, key=lambda x: x["confidence"]))
     elif text == "/leaderboard": await send_leaderboard(chat_id)
+    elif text == "/stats": await send_stats(chat_id)
     elif text == "/buy": await handle_buy(chat_id, user_id)
     elif text == "/sell": await handle_sell(chat_id, user_id)
 
-# 14. RICH SIGNAL CARDS
 async def send_rich_card(chat_id, s):
     msg = f"🚨 {s['signal']} SIGNAL\n\n"
-    msg += f"Asset: {s['asset']}\nConfidence: {s['confidence']}%\n\n"
+    msg += f"Asset: {s['asset']}\nConfidence: {s['confidence']}% ({s['grade']})\n\n"
     msg += f"Entry:\n{s['entry']}\n\nTarget:\n{s['take_profit']}\n\nStop:\n{s['stop_loss']}\n\n"
     msg += f"Reasons:\n" + "\n".join(s['reasons'])
     msg += f"\n\nTimeframes: 15m:{s['timeframes']['15m']} 1h:{s['timeframes']['1h']} 4h:{s['timeframes']['4h']}"
+    msg += f"\nMarket: {s['market_regime'].upper()}"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def send_leaderboard(chat_id):
     run_scanner()
     signals = sorted(cache["signals"].values(), key=lambda x: x["confidence"], reverse=True)
-    msg = "🏆 LEADERBOARD\n\n"
+    msg = f"🏆 LEADERBOARD | Market: {cache['market_regime'].upper()}\n\n"
     for i, s in enumerate(signals[:5], 1):
-        msg += f"{i}. {s['asset']} - {s['confidence']}% {s['signal']}\n"
+        msg += f"{i}. {s['asset']} - {s['confidence']}% ({s['grade']}) {s['signal']}\n"
+    await bot.send_message(chat_id=chat_id, text=msg)
+
+async def send_stats(chat_id):
+    check_closed_signals()
+    win_rate = round(performance["wins"] / performance["total"] * 100, 1) if performance["total"] > 0 else 0
+    msg = f"📊 AGENT STATS\n\n"
+    msg += f"Total Signals: {performance['total']}\n"
+    msg += f"Wins: {performance['wins']}\n"
+    msg += f"Losses: {performance['losses']}\n"
+    msg += f"Win Rate: {win_rate}%\n"
+    msg += f"Market Regime: {cache['market_regime'].upper()}\n"
+    msg += f"Best Asset: {agent_memory['best_asset']} ({agent_memory['best_asset_win_rate']}%)"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def handle_buy(chat_id, user_id):
@@ -360,23 +415,20 @@ def oracle():
     run_scanner()
     return cache["signals"]
 
-# 2. BEST SIGNAL ENDPOINT
 @app.get("/best_signal")
 def best_signal():
     run_scanner()
     signals = [s for s in cache["signals"].values() if s["signal"] in ["BUY", "SHORT"]]
     if not signals: return {"asset": "NONE", "signal": "NONE", "confidence": 0}
     best = max(signals, key=lambda x: x["confidence"])
-    return {"asset": best["asset"], "signal": best["signal"], "confidence": best["confidence"]}
+    return {"asset": best["asset"], "signal": best["signal"], "confidence": best["confidence"], "grade": best["grade"]}
 
-# 3. LEADERBOARD ENDPOINT
 @app.get("/leaderboard")
 def leaderboard():
     run_scanner()
     signals = sorted(cache["signals"].values(), key=lambda x: x["confidence"], reverse=True)
-    return [{"asset": s["asset"], "confidence": s["confidence"]} for s in signals]
+    return [{"asset": s["asset"], "confidence": s["confidence"], "grade": s["grade"]} for s in signals]
 
-# 4. PERFORMANCE TRACKING
 @app.get("/performance")
 def get_performance():
     check_closed_signals()
@@ -384,7 +436,6 @@ def get_performance():
     return {"total_signals": performance["total"], "wins": performance["wins"],
             "losses": performance["losses"], "win_rate": f"{win_rate}%"}
 
-# 5. AGENT QUERY ENDPOINT - CROO A2A
 @app.post("/agent/query")
 async def agent_query(request: Request):
     data = await request.json()
@@ -394,33 +445,112 @@ async def agent_query(request: Request):
         signals = [s for s in cache["signals"].values() if "Dip" in str(s.get("reasons", []))]
         if not signals: return {"error": "No pullback found"}
         best = max(signals, key=lambda x: x["confidence"])
-        return {"asset": best["asset"], "confidence": best["confidence"], "signal": best["signal"]}
+        return {"asset": best["asset"], "confidence": best["confidence"], "signal": best["signal"], "grade": best["grade"]}
     return best_signal()
 
-# 9. SIGNAL HISTORY
 @app.get("/history")
 def history():
     return signal_history[-50:]
 
-# 10. CAP METADATA
+# 1. CAP DISCOVERY ENDPOINT
+@app.get("/.well-known/agent.json")
+def agent_manifest():
+    return {
+        "name": "CROO AI Oracle",
+        "description": "Autonomous crypto intelligence agent",
+        "version": "10.0",
+        "endpoint": "/agent/query",
+        "capabilities": ["pullback_detection", "market_intelligence", "signal_ranking", "regime_detection"]
+    }
+
+# 2. EXPLAINABILITY ENDPOINT
+@app.get("/explain/{symbol}")
+def explain(symbol: str):
+    run_scanner()
+    asset = symbol.upper() + "USDT"
+    signal = cache["signals"].get(asset)
+    if not signal: return {"error": "No signal found"}
+    return {
+        "asset": signal["asset"],
+        "signal": signal["signal"],
+        "confidence": signal["confidence"],
+        "grade": signal["grade"],
+        "reasons": signal["reasons"],
+        "market_regime": signal["market_regime"],
+        "timeframes": signal["timeframes"]
+    }
+
+# 3. AGENT REVENUE SIMULATION
+@app.get("/agent/revenue")
+def revenue():
+    return {
+        "model": "pay_per_signal",
+        "price_per_call": "0.01 CRO",
+        "monthly_projection": "500 CRO",
+        "total_calls": agent_memory["total_calls"],
+        "revenue_simulated": round(agent_memory["revenue_simulated"], 2)
+    }
+
+# 4. SIGNAL ACCURACY DASHBOARD
+@app.get("/stats")
+def stats():
+    check_closed_signals()
+    accuracy = round(performance["wins"] / performance["total"] * 100, 1) if performance["total"] > 0 else 0
+    return {
+        "accuracy": f"{accuracy}%",
+        "total_signals": performance["total"],
+        "wins": performance["wins"],
+        "losses": performance["losses"],
+        "market_regime": cache["market_regime"],
+        "best_asset": agent_memory["best_asset"],
+        "best_asset_win_rate": f"{agent_memory['best_asset_win_rate']}%"
+    }
+
+# 5. AGENT REPUTATION SCORE
+@app.get("/reputation")
+def reputation():
+    score = min(100, performance["wins"] * 2)
+    return {"reputation_score": score, "grade": get_confidence_grade(score)}
+
+# 7. AGENT MEMORY
+@app.get("/agent/memory")
+def get_memory():
+    return agent_memory
+
+# 9. HACKATHON DEMO ENDPOINT
+@app.get("/demo")
+def demo():
+    run_scanner()
+    signals = [s for s in cache["signals"].values() if s["signal"] in ["BUY", "SHORT"]]
+    if not signals: return {"error": "No signals"}
+    best = max(signals, key=lambda x: x["confidence"])
+    return {
+        "best_signal": best["asset"],
+        "confidence": best["confidence"],
+        "grade": best["grade"],
+        "entry": best["entry"],
+        "tp": best["take_profit"],
+        "sl": best["stop_loss"],
+        "market_regime": best["market_regime"]
+    }
+
 @app.get("/cap/metadata")
 def cap_metadata():
-    return {"agent": "CROO AI Oracle", "version": "9.0", "category": "Market Intelligence",
+    return {"agent": "CROO AI Oracle", "version": "10.0", "category": "Market Intelligence",
             "callable": True, "supports": ["BTC", "ETH", "SOL", "XRP", "CRO"]}
 
-# 11. AGENT PRICING
 @app.get("/pricing")
 def pricing():
     return {"free": "5 requests/day", "pro": "Unlimited", "enterprise": "API Access"}
 
-# 12. AGENT CAPABILITIES
 @app.get("/capabilities")
 def capabilities():
     return {"features": ["pullback_detection", "bounce_detection", "rally_to_resistance",
             "multi_timeframe_analysis", "confidence_scoring", "market_intelligence",
-            "signal_ranking", "auto_scanning"]}
+            "signal_ranking", "auto_scanning", "regime_detection", "explainability"]}
 
 @app.get("/cap/health")
 def cap_health():
     return {"agent": "CROO AI Oracle", "status": "active", "assets": ASSETS,
-            "data_sources": ["Binance", "MEXC", "CoinGecko"], "uptime_seconds": int(time.time() - start_time)}
+            "data_sources": ["Binance", "MEXC", "CoinGecko"], "uptime_seconds": int(time.time() - start_time),
+            "market_regime": cache["market_regime"], "version": "10.0"}
