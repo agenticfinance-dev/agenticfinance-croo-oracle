@@ -103,24 +103,8 @@ def fetch_coinbase_candles(asset):
         print(f"Coinbase ERR {asset}: {e}")
     return None, None
 
-def fetch_cryptocompare(asset):
-    cc_map = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL", "XRPUSDT": "XRP",
-              "CROUSDT": "CRO", "LINKUSDT": "LINK", "AVAXUSDT": "AVAX", "SUIUSDT": "SUI",
-              "ATOMUSDT": "ATOM", "BNBUSDT": "BNB"}
-    try:
-        sym = cc_map[asset]
-        url = "https://min-api.cryptocompare.com/data/v2/histohour"
-        r = requests.get(url, params={"fsym": sym, "tsym": "USD", "limit": 100}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()["Data"]["Data"]
-            klines = [[d["time"]*1000, d["open"], d["high"], d["low"], d["close"], d["volumeto"]] for d in data]
-            return klines, "CryptoCompare"
-    except Exception as e:
-        print(f"CryptoCompare ERR {asset}: {e}")
-    return None, None
-
 def get_ohlcv(asset):
-    for func in [fetch_coingecko_ohlcv, fetch_kraken_ohlc, fetch_coinbase_candles, fetch_cryptocompare]:
+    for func in [fetch_coingecko_ohlcv, fetch_kraken_ohlc, fetch_coinbase_candles]:
         klines, source = func(asset)
         if klines: return klines, source
     return None, "none"
@@ -203,7 +187,7 @@ def analyze_asset(symbol):
             return {
                 "asset": symbol.replace("USDT", ""), "signal": "WATCH", "confidence": 20,
                 "grade": "D", "price": round(price, 4), "entry": 0, "stop_loss": 0, "take_profit": 0,
-                "reasons": ["Price only - OHLCV unavailable"], "missing": ["Full OHLCV data"], "source": "price_only"
+                "reasons": ["Price only"], "missing": ["Full OHLCV data"], "source": "price_only"
             }
         return {"asset": symbol.replace("USDT", ""), "signal": "NONE", "confidence": 0, "price": 0, "reasons": ["No Data"]}
 
@@ -228,43 +212,40 @@ def analyze_asset(symbol):
     missing = []
     score = 0
 
-    # LONG logic
     if rsi_val < 45:
-        reasons.append("✅ RSI Oversold"); score += 20
+        reasons.append("RSI Oversold"); score += 20
     else:
         missing.append("RSI not oversold")
 
     if price > ema50:
-        reasons.append("✅ Above EMA50"); score += 20
+        reasons.append("Above EMA50"); score += 20
     else:
-        missing.append("Price below EMA50")
+        missing.append("Below EMA50")
 
-    if 4 < pullback < 12:
-        reasons.append(f"✅ Meaningful Dip {pullback:.1f}%"); score += 20
+    if 4 < pullback < 12 and price_near_ema20:
+        reasons.append(f"Dip {pullback:.1f}% to EMA20"); score += 20
     else:
-        missing.append("Pullback too shallow or too deep")
+        missing.append("No meaningful pullback to support")
 
     if vol_spike:
-        reasons.append("✅ Volume Spike"); score += 20
+        reasons.append("Volume Spike"); score += 20
     else:
         missing.append("No volume confirmation")
 
     if bullish_confirmation:
-        reasons.append("✅ Bullish Confirmation Candle"); score += 20
+        reasons.append("Bullish Confirmation Candle"); score += 20
     else:
         missing.append("No bullish candle close")
 
     if price_near_ema20:
-        reasons.append("✅ Near EMA20 Support")
         score += 10
     else:
-        missing.append("Price not at EMA20 support")
+        missing.append("Price not at EMA20")
 
     fg = cache["fear_greed"]
-    if fg < 25: reasons.append("✅ Extreme Fear"); score += 10
+    if fg < 25: reasons.append("Extreme Fear"); score += 10
     if fg > 75: missing.append("Market too greedy")
 
-    # SHORT logic
     short_score = 0
     if rsi_val > 55: short_score += 20
     if price < ema50: short_score += 20
@@ -372,7 +353,6 @@ def scan_all():
     signal_history[:] = signal_history[-100:]
     cache["signals"] = results
     cache["last_scan"] = time.time()
-    print(f"Scan complete. Signals: {len(results)}")
     return results
 
 async def scanner_loop():
@@ -385,7 +365,6 @@ async def startup_event():
     if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN and bot:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         await bot.set_webhook(url=webhook_url)
-        print(f"Webhook set: {webhook_url}")
     scan_all()
     asyncio.create_task(scanner_loop())
 
@@ -416,21 +395,24 @@ async def handle_message(chat_id, text, user_id):
              InlineKeyboardButton("📈 SOL", callback_data="SOLUSDT")],
             [InlineKeyboardButton("📈 BNB", callback_data="BNBUSDT"),
              InlineKeyboardButton("📈 LINK", callback_data="LINKUSDT")],
-            [InlineKeyboardButton("💎 Upgrade", callback_data="buy_cmd")]
+            [InlineKeyboardButton("📈 XRP", callback_data="XRPUSDT"),
+             InlineKeyboardButton("📈 AVAX", callback_data="AVAXUSDT")],
+            [InlineKeyboardButton("📈 SUI", callback_data="SUIUSDT"),
+             InlineKeyboardButton("📈 ATOM", callback_data="ATOMUSDT")],
+            [InlineKeyboardButton("📈 CRO", callback_data="CROUSDT"),
+             InlineKeyboardButton("💎 Upgrade", callback_data="buy_cmd")]
         ]
         regime = cache["market_regime"].upper()
         signals = sorted(cache["signals"].values(), key=lambda x: x["confidence"], reverse=True)
         top = signals[0] if signals else None
 
-        msg = "🔮 CROO AI Oracle - Market Intelligence\n\n"
-        msg += f"Market Regime: {regime} | F&G: {cache['fear_greed']}\n"
-        msg += "Autonomous scanning every 5 min\n"
-        msg += "Assets: BTC, ETH, SOL, XRP, CRO, LINK, AVAX, SUI, ATOM, BNB\n"
+        msg = "🔮 CROO AI Oracle\n\n"
+        msg += f"Market: {regime} | F&G: {cache['fear_greed']}\n"
+        msg += f"Assets: {len(ASSETS)} monitored\n"
         if top and top["confidence"] > 0:
-            msg += f"🔥 TOP: {top['asset']} {top['signal']} {top['confidence']}% ({top['grade']})\n"
-            msg += f"Price: ${top['price']} | Source: {top.get('source', 'N/A')}\n\n"
-        msg += "Demo: All features FREE for judges\n\n"
-        msg += "/scan /best /leaderboard /stats /buy /sell"
+            msg += f"\n🔥 Top: {top['asset']} {top['signal']} {top['confidence']}% ({top['grade']})\n"
+            msg += f"Price: ${top['price']} | {top.get('source', 'N/A')}\n"
+        msg += "\n/scan /best /leaderboard /stats"
         await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     elif text in ["/scan", "/signals"]:
         scan_all(); await send_leaderboard(chat_id)
@@ -459,7 +441,7 @@ async def send_rich_card(chat_id, s):
     msg += f"Bullish Reasons:\n" + "\n".join(s.get('reasons', ['None']))
     if s.get('missing'):
         msg += f"\n\nMissing Conditions:\n" + "\n".join([f"❌ {m}" for m in s['missing']])
-    msg += f"\n\nNeed 80% confidence for BUY\nCurrent: {s['confidence']}%"
+    msg += f"\n\nNeed 80% for BUY\nCurrent: {s['confidence']}%"
     msg += f"\nMarket: {s['market_regime'].upper()} | F&G: {s['fear_greed']} | Source: {s.get('source', 'N/A')}"
     await bot.send_message(chat_id=chat_id, text=msg)
 
@@ -467,7 +449,7 @@ async def send_leaderboard(chat_id):
     scan_all()
     signals = sorted(cache["signals"].values(), key=lambda x: x["confidence"], reverse=True)
     msg = f"🏆 LEADERBOARD | {cache['market_regime'].upper()} | F&G: {cache['fear_greed']}\n\n"
-    for i, s in enumerate(signals[:5], 1):
+    for i, s in enumerate(signals[:10], 1):
         msg += f"{i}. {s.get('asset','N/A')} - {s.get('confidence',0)}% ({s.get('grade','N/A')}) {s.get('signal','NONE')}\n"
         msg += f" ${s.get('price',0)} | {s.get('source','N/A')}\n"
     await bot.send_message(chat_id=chat_id, text=msg)
@@ -487,13 +469,13 @@ async def send_stats(chat_id):
 
 async def handle_buy(chat_id, user_id):
     if PAYMENTS_ENABLED:
-        await bot.send_message(chat_id=chat_id, text="Payments enable post-hackathon...")
+        await bot.send_message(chat_id=chat_id, text="Payments enabled post-launch.")
     else:
         if is_pro(user_id):
             await bot.send_message(chat_id=chat_id, text="You're already Pro ✅")
         else:
             activate_pro(user_id, 999)
-            await bot.send_message(chat_id=chat_id, text="✅ DEMO: Pro activated\n\nAll signals unlocked for Croo judging.\nMonetization: Post-launch via Telegram Payments")
+            await bot.send_message(chat_id=chat_id, text="✅ Pro activated\n\nAll signals unlocked.")
 
 async def handle_sell(chat_id, user_id):
     if not is_pro(user_id):
@@ -501,7 +483,7 @@ async def handle_sell(chat_id, user_id):
     else:
         users_db[user_id]["plan"] = "free"
         users_db[user_id]["pro_expires"] = None
-        await bot.send_message(chat_id=chat_id, text="✅ DEMO: Pro cancelled\n\nIn production: Cancels recurring billing.")
+        await bot.send_message(chat_id=chat_id, text="✅ Pro cancelled")
 
 async def handle_callback(chat_id, data, user_id):
     if data == "scan_all": scan_all(); await send_leaderboard(chat_id)
@@ -522,7 +504,7 @@ async def handle_callback(chat_id, data, user_id):
 # ==================== API ENDPOINTS ====================
 @app.get("/")
 def root():
-    return {"status": "CROO AI Oracle Online", "mode": "hackathon", "payments": PAYMENTS_ENABLED, "version": "10.1"}
+    return {"status": "CROO AI Oracle Online", "version": "10.1"}
 
 @app.get("/health")
 def health():
