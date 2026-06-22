@@ -10,7 +10,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 app = FastAPI()
 
-# ===== CONFIG =====
+# ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
@@ -24,8 +24,13 @@ start_time = time.time()
 
 ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "CROUSDT"]
 
-# ===== STATE =====
-cache = {"signals": {}, "last_scan": 0, "market_regime": "neutral", "fear_greed": 50}
+# ==================== STATE ====================
+cache = {
+    "signals": {},
+    "last_scan": 0,
+    "market_regime": "neutral",
+    "fear_greed": 50
+}
 signal_history = []
 users_db = {}
 last_alerted = {}
@@ -38,22 +43,21 @@ agent_memory = {
     "revenue_simulated": 0.0
 }
 
-# ===== DATA HELPERS =====
-def get_binance_klines(symbol, interval="1h", limit=100):
+# ==================== DATA SOURCES ====================
+def fetch_binance(symbol, interval="1h", limit=100):
     try:
         url = "https://api.binance.com/api/v3/klines"
         r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit},
                          headers={'User-Agent': 'CROO-Agent/10.0'}, timeout=8)
-        if r.status_code == 200: 
+        if r.status_code == 200:
             print(f"Binance OK: {symbol} {interval}")
             return r.json()
-        else:
-            print(f"Binance FAIL {symbol} {interval}: {r.status_code}")
-    except Exception as e: 
+        print(f"Binance FAIL {symbol} {interval}: {r.status_code}")
+    except Exception as e:
         print(f"Binance ERR {symbol}: {e}")
     return None
 
-def get_mexc_klines(symbol, interval="1h", limit=100):
+def fetch_mexc(symbol, interval="1h", limit=100):
     try:
         url = "https://api.mexc.com/api/v3/klines"
         r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit},
@@ -61,13 +65,12 @@ def get_mexc_klines(symbol, interval="1h", limit=100):
         if r.status_code == 200:
             print(f"MEXC OK: {symbol} {interval}")
             return r.json()
-        else:
-            print(f"MEXC FAIL {symbol} {interval}: {r.status_code}")
+        print(f"MEXC FAIL {symbol} {interval}: {r.status_code}")
     except Exception as e:
         print(f"MEXC ERR {symbol}: {e}")
     return None
 
-def get_coingecko_ohlcv(asset, days=1):
+def fetch_coingecko_ohlcv(asset, days=1):
     mapping = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "SOLUSDT": "solana",
                "XRPUSDT": "ripple", "CROUSDT": "crypto-com-chain"}
     try:
@@ -76,50 +79,45 @@ def get_coingecko_ohlcv(asset, days=1):
         r = requests.get(url, params={"vs_currency": "usd", "days": days, "interval": "hourly"}, timeout=8)
         if r.status_code == 200:
             data = r.json()
-            prices = data["prices"]
-            volumes = data["total_volumes"]
             klines = []
-            for i in range(len(prices)):
-                ts = prices[i][0]
-                close = prices[i][1]
-                vol = volumes[i][1] if i < len(volumes) else 0
-                klines.append([ts, close, vol])
+            for i in range(len(data["prices"])):
+                ts = data["prices"][i][0]
+                close = data["prices"][i][1]
+                vol = data["total_volumes"][i][1] if i < len(data["total_volumes"]) else 0
+                klines.append([ts, close, close, close, vol])
             print(f"CoinGecko OK: {asset} {days}d")
             return klines[-100:]
     except Exception as e:
         print(f"CoinGecko ERR {asset}: {e}")
     return None
 
-def get_coingecko_price(asset):
+def fetch_price(symbol):
+    klines = fetch_binance(symbol, "1h", 1)
+    if klines: return float(klines[-1][4])
+    klines = fetch_mexc(symbol, "1h", 1)
+    if klines: return float(klines[-1][4])
     mapping = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "SOLUSDT": "solana",
                "XRPUSDT": "ripple", "CROUSDT": "crypto-com-chain"}
     try:
         r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": mapping[asset], "vs_currencies": "usd"}, timeout=8)
-        if r.status_code == 200: return float(r.json()[mapping[asset]]["usd"])
+            params={"ids": mapping[symbol], "vs_currencies": "usd"}, timeout=8)
+        if r.status_code == 200: return float(r.json()[mapping[symbol]]["usd"])
     except: pass
-    return None
+    return 0
 
-def get_fear_greed():
+def fetch_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/", timeout=8)
         if r.status_code == 200:
             val = int(r.json()["data"][0]["value"])
             cache["fear_greed"] = val
-            print(f"Fear & Greed: {val}")
             return val
     except Exception as e:
         print(f"F&G ERR: {e}")
     return 50
 
-def get_current_price(symbol):
-    klines = get_binance_klines(symbol, "1h", 1)
-    if klines: return float(klines[-1][4])
-    klines = get_mexc_klines(symbol, "1h", 1)
-    if klines: return float(klines[-1][4])
-    return get_coingecko_price(symbol) or 0
-
-def calc_rsi(closes, period=14):
+# ==================== INDICATORS ====================
+def rsi(closes, period=14):
     if len(closes) < period + 1: return np.array([50.0] * len(closes))
     deltas = np.diff(closes)
     seed = deltas[:period]
@@ -138,18 +136,19 @@ def calc_rsi(closes, period=14):
         rsi[i] = 100. - 100. / (1. + rs)
     return rsi
 
-def calc_ema(closes, period):
+def ema(closes, period):
     if len(closes) < period: return np.array([closes[-1]] if len(closes) > 0 else [0])
     return np.convolve(closes, np.ones(period)/period, mode='valid')
 
-def get_confidence_grade(confidence):
+def grade(confidence):
     if confidence >= 90: return "A+"
     elif confidence >= 80: return "A"
     elif confidence >= 70: return "B"
     elif confidence >= 60: return "C"
-    else: return "D"
+    return "D"
 
-def is_pro(user_id: int) -> bool:
+# ==================== CORE LOGIC ====================
+def get_user_plan(user_id: int) -> bool:
     user = users_db.get(user_id, {})
     if not user: return False
     if user.get("plan") == "lifetime": return True
@@ -161,37 +160,30 @@ def activate_pro(user_id: int, days: int = 30):
     users_db[user_id]["plan"] = "pro"
     users_db[user_id]["pro_expires"] = datetime.now() + timedelta(days=days)
 
-def detect_market_regime():
-    btc_klines = get_binance_klines("BTCUSDT", "4h", 100)
-    if not btc_klines: btc_klines = get_mexc_klines("BTCUSDT", "4h", 100)
-    if not btc_klines: btc_klines = get_coingecko_ohlcv("BTCUSDT", 4)
-    if not btc_klines: return "neutral"
-    closes = np.array([float(k[4]) for k in btc_klines])
-    ema50 = calc_ema(closes, 50)[-1]
-    price = closes[-1]
-    return "bullish" if price > ema50 else "bearish"
+def market_regime():
+    klines = fetch_binance("BTCUSDT", "4h", 100) or fetch_mexc("BTCUSDT", "4h", 100) or fetch_coingecko_ohlcv("BTCUSDT", 4)
+    if not klines: return "neutral"
+    closes = np.array([float(k[4]) for k in klines])
+    ema50 = ema(closes, 50)[-1]
+    return "bullish" if closes[-1] > ema50 else "bearish"
 
-def analyze_timeframe(symbol, interval):
-    klines = get_binance_klines(symbol, interval)
-    source = "binance"
-    if not klines:
-        klines = get_mexc_klines(symbol, interval)
-        source = "mexc"
+def analyze_tf(symbol, interval):
+    klines = fetch_binance(symbol, interval) or fetch_mexc(symbol, interval)
+    source = "binance" if klines else "mexc"
     if not klines:
         days = 1 if interval in ["15m", "1h"] else 4
-        klines = get_coingecko_ohlcv(symbol, days)
+        klines = fetch_coingecko_ohlcv(symbol, days)
         source = "coingecko"
-    
+
     if not klines or len(klines) < 50:
-        print(f"No data for {symbol} {interval} from any source")
-        return {"confidence": 0, "price": get_current_price(symbol), "source": "price_only"}
+        return {"confidence": 0, "price": fetch_price(symbol), "source": "price_only"}
 
     closes = np.array([float(k[4]) for k in klines])
     volumes = np.array([float(k[5]) for k in klines])
     price = closes[-1]
-    rsi = calc_rsi(closes)[-1]
-    ema20 = calc_ema(closes, 20)[-1] if len(calc_ema(closes, 20)) > 0 else price
-    ema50 = calc_ema(closes, 50)[-1] if len(calc_ema(closes, 50)) > 0 else price
+    rsi_val = rsi(closes)[-1]
+    ema20 = ema(closes, 20)[-1] if len(ema(closes, 20)) > 0 else price
+    ema50 = ema(closes, 50)[-1] if len(ema(closes, 50)) > 0 else price
 
     recent_high = max(closes[-20:])
     recent_low = min(closes[-20:])
@@ -201,17 +193,17 @@ def analyze_timeframe(symbol, interval):
     vol_spike = volumes[-1] > avg_vol * 1.5 if avg_vol > 0 else False
 
     long_score = 0
-    if rsi < 45: long_score += 30
+    if rsi_val < 45: long_score += 30
     if price > ema50: long_score += 25
     if 2 < pullback < 12: long_score += 25
     if vol_spike: long_score += 20
 
     short_score = 0
-    if rsi > 55: short_score += 25
+    if rsi_val > 55: short_score += 25
     if price < ema50: short_score += 25
     if 2 < bounce < 12: short_score += 20
-    rally_to_resistance = ((ema20 - price) / price * 100) if price < ema20 else 0
-    if 0 < rally_to_resistance < 3: short_score += 15
+    rally = ((ema20 - price) / price * 100) if price < ema20 else 0
+    if 0 < rally < 3: short_score += 15
     if vol_spike: short_score += 15
 
     fg = cache["fear_greed"]
@@ -220,31 +212,35 @@ def analyze_timeframe(symbol, interval):
 
     confidence = max(long_score, short_score)
     direction = "LONG" if long_score >= short_score else "SHORT"
-    return {"confidence": confidence, "price": price, "rsi": rsi, "ema20": ema20,
-            "ema50": ema50, "pullback": pullback, "bounce": bounce, "source": source,
-            "direction": direction, "vol_spike": vol_spike}
+    return {
+        "confidence": confidence, "price": price, "rsi": rsi_val, "ema20": ema20,
+        "ema50": ema50, "pullback": pullback, "bounce": bounce, "source": source,
+        "direction": direction, "vol_spike": vol_spike
+    }
 
 def analyze_asset(symbol):
-    tf_15m = analyze_timeframe(symbol, "15m")
-    tf_1h = analyze_timeframe(symbol, "1h")
-    tf_4h = analyze_timeframe(symbol, "4h")
+    tf_15m = analyze_tf(symbol, "15m")
+    tf_1h = analyze_tf(symbol, "1h")
+    tf_4h = analyze_tf(symbol, "4h")
 
     if tf_1h["price"] == 0:
-        price = get_current_price(symbol)
+        price = fetch_price(symbol)
         if price > 0:
-            return {"asset": symbol.replace("USDT", ""), "signal": "WATCH", "confidence": 20, 
-                    "grade": "D", "price": round(price, 4), "entry": round(price, 4),
-                    "reasons": ["Price only - OHLCV blocked"], "source": "coingecko_price"}
+            return {
+                "asset": symbol.replace("USDT", ""), "signal": "WATCH", "confidence": 20,
+                "grade": "D", "price": round(price, 4), "entry": round(price, 4),
+                "reasons": ["Price only - OHLCV blocked"], "source": "coingecko_price"
+            }
         return {"asset": symbol.replace("USDT", ""), "signal": "NONE", "confidence": 0, "price": 0, "reasons": ["No Data"]}
 
     confidence = int(tf_15m["confidence"] * 0.2 + tf_1h["confidence"] * 0.3 + tf_4h["confidence"] * 0.5)
     direction = tf_1h["direction"]
     price = tf_1h["price"]
-    rsi = tf_1h["rsi"]
+    rsi_val = tf_1h["rsi"]
 
     reasons = []
-    if rsi < 45 and direction == "LONG": reasons.append("✅ RSI Oversold")
-    if rsi > 55 and direction == "SHORT": reasons.append("✅ RSI Overbought")
+    if rsi_val < 45 and direction == "LONG": reasons.append("✅ RSI Oversold")
+    if rsi_val > 55 and direction == "SHORT": reasons.append("✅ RSI Overbought")
     if price > tf_1h["ema50"] and direction == "LONG": reasons.append("✅ Above EMA50")
     if price < tf_1h["ema50"] and direction == "SHORT": reasons.append("✅ Below EMA50")
     if 2 < tf_1h["pullback"] < 12 and direction == "LONG": reasons.append(f"✅ Dip {tf_1h['pullback']:.1f}%")
@@ -254,7 +250,6 @@ def analyze_asset(symbol):
 
     signal = "NONE"
     if confidence >= 75: signal = "BUY" if direction == "LONG" else "SHORT"
-    elif confidence >= 50: signal = "WATCH"
     elif confidence >= 20: signal = "WATCH"
 
     stop_loss = round(price * 0.95, 4) if signal == "BUY" else round(price * 1.05, 4) if signal == "SHORT" else 0
@@ -262,49 +257,49 @@ def analyze_asset(symbol):
 
     return {
         "asset": symbol.replace("USDT", ""), "price": round(price, 4), "signal": signal,
-        "confidence": confidence, "grade": get_confidence_grade(confidence), "direction": direction,
-        "entry": round(price, 4), "stop_loss": stop_loss, "take_profit": take_profit, 
-        "rsi": round(rsi, 1), "reasons": reasons,
+        "confidence": confidence, "grade": grade(confidence), "direction": direction,
+        "entry": round(price, 4), "stop_loss": stop_loss, "take_profit": take_profit,
+        "rsi": round(rsi_val, 1), "reasons": reasons,
         "timeframes": {"15m": tf_15m["confidence"], "1h": tf_1h["confidence"], "4h": tf_4h["confidence"]},
-        "source": tf_1h["source"], "market_regime": cache["market_regime"], 
+        "source": tf_1h["source"], "market_regime": cache["market_regime"],
         "fear_greed": cache["fear_greed"], "timestamp": datetime.utcnow().isoformat()
     }
 
-def check_closed_signals():
+def update_performance():
     for signal in signal_history:
         if signal.get("status") == "open" and signal.get("entry", 0) > 0:
-            current_price = get_current_price(signal["asset"] + "USDT")
-            if current_price == 0: continue
+            current = fetch_price(signal["asset"] + "USDT")
+            if current == 0: continue
             if signal["direction"] == "LONG":
-                if current_price >= signal["take_profit"]:
+                if current >= signal["take_profit"]:
                     signal["pnl"] = round((signal["take_profit"] - signal["entry"]) / signal["entry"] * 100, 2)
                     signal["status"] = "win"; performance["wins"] += 1; performance["total"] += 1
-                elif current_price <= signal["stop_loss"]:
+                elif current <= signal["stop_loss"]:
                     signal["pnl"] = round((signal["stop_loss"] - signal["entry"]) / signal["entry"] * 100, 2)
                     signal["status"] = "loss"; performance["losses"] += 1; performance["total"] += 1
             elif signal["direction"] == "SHORT":
-                if current_price <= signal["take_profit"]:
+                if current <= signal["take_profit"]:
                     signal["pnl"] = round((signal["entry"] - signal["take_profit"]) / signal["entry"] * 100, 2)
                     signal["status"] = "win"; performance["wins"] += 1; performance["total"] += 1
-                elif current_price >= signal["stop_loss"]:
+                elif current >= signal["stop_loss"]:
                     signal["pnl"] = round((signal["entry"] - signal["stop_loss"]) / signal["entry"] * 100, 2)
                     signal["status"] = "loss"; performance["losses"] += 1; performance["total"] += 1
-    update_agent_memory()
+    update_memory()
 
-def update_agent_memory():
+def update_memory():
     agent_memory["last_100_signals"] = signal_history[-100:]
-    asset_stats = {}
+    stats = {}
     for sig in signal_history:
         if sig.get("status") in ["win", "loss"]:
             asset = sig["asset"]
-            if asset not in asset_stats: asset_stats[asset] = {"wins": 0, "total": 0}
-            asset_stats[asset]["total"] += 1
-            if sig["status"] == "win": asset_stats[asset]["wins"] += 1
+            if asset not in stats: stats[asset] = {"wins": 0, "total": 0}
+            stats[asset]["total"] += 1
+            if sig["status"] == "win": stats[asset]["wins"] += 1
     best = None
     best_rate = 0
-    for asset, stats in asset_stats.items():
-        if stats["total"] >= 3:
-            rate = stats["wins"] / stats["total"]
+    for asset, s in stats.items():
+        if s["total"] >= 3:
+            rate = s["wins"] / s["total"]
             if rate > best_rate:
                 best_rate = rate; best = asset
     agent_memory["best_asset"] = best or "NONE"
@@ -323,11 +318,11 @@ async def send_alert(signal):
         except: pass
     last_alerted[signal["asset"]] = time.time()
 
-def run_scanner():
+def scan_all():
     print("Starting scan...")
-    get_fear_greed()
-    check_closed_signals()
-    cache["market_regime"] = detect_market_regime()
+    fetch_fear_greed()
+    update_performance()
+    cache["market_regime"] = market_regime()
     results = {}
     for asset in ASSETS:
         data = analyze_asset(asset)
@@ -347,7 +342,7 @@ def run_scanner():
 
 async def scanner_loop():
     while True:
-        run_scanner()
+        scan_all()
         await asyncio.sleep(300)
 
 @app.on_event("startup")
@@ -356,10 +351,10 @@ async def startup_event():
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         await bot.set_webhook(url=webhook_url)
         print(f"Webhook set: {webhook_url}")
-    run_scanner()
+    scan_all()
     asyncio.create_task(scanner_loop())
 
-# ===== TELEGRAM =====
+# ==================== TELEGRAM ====================
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
@@ -376,7 +371,7 @@ async def webhook(request: Request):
 async def handle_message(chat_id, text, user_id):
     if not bot: return
     if text == "/start":
-        run_scanner()
+        scan_all()
         keyboard = [
             [InlineKeyboardButton("📊 Scan Markets", callback_data="scan_all"),
              InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
@@ -390,28 +385,28 @@ async def handle_message(chat_id, text, user_id):
         ]
         regime = cache["market_regime"].upper()
         signals = sorted(cache["signals"].values(), key=lambda x: x["confidence"], reverse=True)
-        top_signal = signals[0] if signals else None
-        
+        top = signals[0] if signals else None
+
         msg = "🔮 CROO AI Oracle - Market Intelligence\n\n"
         msg += f"Market Regime: {regime} | F&G: {cache['fear_greed']}\n"
         msg += "Autonomous scanning every 5 min\n"
-        msg += "Assets: BTC, ETH, SOL, XRP, CRO\n\n"
-        if top_signal and top_signal["confidence"] > 0:
-            msg += f"🔥 TOP: {top_signal['asset']} {top_signal['signal']} {top_signal['confidence']}% ({top_signal['grade']})\n"
-            msg += f"Price: ${top_signal['price']}\n\n"
+        msg += "Assets: BTC, ETH, SOL, XRP, CRO\n"
+        if top and top["confidence"] > 0:
+            msg += f"🔥 TOP: {top['asset']} {top['signal']} {top['confidence']}% ({top['grade']})\n"
+            msg += f"Price: ${top['price']}\n\n"
         msg += "Demo: All features FREE for judges\n\n"
         msg += "/scan /best /leaderboard /stats /buy /sell"
         await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     elif text in ["/scan", "/signals"]:
-        run_scanner(); await send_leaderboard(chat_id)
+        scan_all(); await send_leaderboard(chat_id)
     elif text == "/best":
-        run_scanner()
+        scan_all()
         signals = [s for s in cache["signals"].values() if s["confidence"] > 0]
         if not signals:
             await bot.send_message(chat_id=chat_id, text="No signals yet. Scanning...")
         else:
             await send_rich_card(chat_id, max(signals, key=lambda x: x["confidence"]))
-    elif text == "/leaderboard": run_scanner(); await send_leaderboard(chat_id)
+    elif text == "/leaderboard": scan_all(); await send_leaderboard(chat_id)
     elif text == "/stats": await send_stats(chat_id)
     elif text == "/buy": await handle_buy(chat_id, user_id)
     elif text == "/sell": await handle_sell(chat_id, user_id)
@@ -427,7 +422,7 @@ async def send_rich_card(chat_id, s):
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def send_leaderboard(chat_id):
-    run_scanner()
+    scan_all()
     signals = sorted(cache["signals"].values(), key=lambda x: x["confidence"], reverse=True)
     msg = f"🏆 LEADERBOARD | {cache['market_regime'].upper()} | F&G: {cache['fear_greed']}\n\n"
     for i, s in enumerate(signals[:5], 1):
@@ -436,7 +431,7 @@ async def send_leaderboard(chat_id):
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def send_stats(chat_id):
-    check_closed_signals()
+    update_performance()
     win_rate = round(performance["wins"] / performance["total"] * 100, 1) if performance["total"] > 0 else 0
     msg = f"📊 AGENT STATS\n\n"
     msg += f"Total Signals: {performance['total']}\n"
@@ -452,14 +447,14 @@ async def handle_buy(chat_id, user_id):
     if PAYMENTS_ENABLED:
         await bot.send_message(chat_id=chat_id, text="Payments enable post-hackathon...")
     else:
-        if is_pro(user_id):
+        if get_user_plan(user_id):
             await bot.send_message(chat_id=chat_id, text="You're already Pro ✅")
         else:
             activate_pro(user_id, 999)
             await bot.send_message(chat_id=chat_id, text="✅ DEMO: Pro activated\n\nAll signals unlocked for Croo judging.\nMonetization: Post-launch via Telegram Payments")
 
 async def handle_sell(chat_id, user_id):
-    if not is_pro(user_id):
+    if not get_user_plan(user_id):
         await bot.send_message(chat_id=chat_id, text="You're on Free plan.")
     else:
         users_db[user_id]["plan"] = "free"
@@ -467,50 +462,50 @@ async def handle_sell(chat_id, user_id):
         await bot.send_message(chat_id=chat_id, text="✅ DEMO: Pro cancelled\n\nIn production: Cancels recurring billing.")
 
 async def handle_callback(chat_id, data, user_id):
-    if data == "scan_all": run_scanner(); await send_leaderboard(chat_id)
+    if data == "scan_all": scan_all(); await send_leaderboard(chat_id)
     elif data == "best_signal":
-        run_scanner()
+        scan_all()
         signals = [s for s in cache["signals"].values() if s["confidence"] > 0]
         if signals: await send_rich_card(chat_id, max(signals, key=lambda x: x["confidence"]))
         else: await bot.send_message(chat_id=chat_id, text="Scanning... try again in 10s")
-    elif data == "leaderboard": run_scanner(); await send_leaderboard(chat_id)
+    elif data == "leaderboard": scan_all(); await send_leaderboard(chat_id)
     elif data == "buy_cmd": await handle_buy(chat_id, user_id)
     elif data == "sell_cmd": await handle_sell(chat_id, user_id)
     elif data in ASSETS:
-        run_scanner()
+        scan_all()
         s = cache["signals"].get(data)
         if s: await send_rich_card(chat_id, s)
         else: await bot.send_message(chat_id=chat_id, text=f"No data for {data.replace('USDT','')}. APIs blocked.")
 
-# ===== API ENDPOINTS =====
+# ==================== API ENDPOINTS ====================
 @app.get("/")
 def root():
     return {"status": "CROO AI Oracle Online", "mode": "hackathon", "payments": PAYMENTS_ENABLED, "version": "10.0"}
 
 @app.get("/oracle")
 def oracle():
-    run_scanner()
+    scan_all()
     return cache["signals"]
 
 @app.get("/best_signal")
 def best_signal():
-    run_scanner()
+    scan_all()
     signals = [s for s in cache["signals"].values() if s["confidence"] > 0]
     if not signals: return {"asset": "NONE", "signal": "NONE", "confidence": 0}
     best = max(signals, key=lambda x: x["confidence"])
-    return {"asset": best["asset"], "signal": best["signal"], "confidence": best["confidence"], 
+    return {"asset": best["asset"], "signal": best["signal"], "confidence": best["confidence"],
             "grade": best["grade"], "entry": best["entry"], "price": best["price"]}
 
 @app.get("/leaderboard")
 def leaderboard():
-    run_scanner()
+    scan_all()
     signals = sorted(cache["signals"].values(), key=lambda x: x["confidence"], reverse=True)
-    return [{"asset": s["asset"], "confidence": s["confidence"], "grade": s["grade"], 
+    return [{"asset": s["asset"], "confidence": s["confidence"], "grade": s["grade"],
              "signal": s["signal"], "price": s["price"]} for s in signals]
 
 @app.get("/performance")
 def get_performance():
-    check_closed_signals()
+    update_performance()
     win_rate = round(performance["wins"] / performance["total"] * 100, 1) if performance["total"] > 0 else 0
     return {"total_signals": performance["total"], "wins": performance["wins"],
             "losses": performance["losses"], "win_rate": f"{win_rate}%"}
@@ -519,7 +514,7 @@ def get_performance():
 async def agent_query(request: Request):
     data = await request.json()
     task = data.get("task", "")
-    run_scanner()
+    scan_all()
     if task == "find_best_pullback":
         signals = [s for s in cache["signals"].values() if "Dip" in str(s.get("reasons", []))]
         if not signals: return {"error": "No pullback found"}
@@ -543,14 +538,14 @@ def agent_manifest():
 
 @app.get("/explain/{symbol}")
 def explain(symbol: str):
-    run_scanner()
+    scan_all()
     asset = symbol.upper() + "USDT"
     signal = cache["signals"].get(asset)
     if not signal: return {"error": "No signal found", "symbol": symbol}
     return {
         "asset": signal["asset"], "signal": signal["signal"], "confidence": signal["confidence"],
         "grade": signal["grade"], "reasons": signal["reasons"], "market_regime": signal["market_regime"],
-        "fear_greed": signal["fear_greed"], "timeframes": signal["timeframes"], 
+        "fear_greed": signal["fear_greed"], "timeframes": signal["timeframes"],
         "price": signal["price"], "rsi": signal["rsi"]
     }
 
@@ -563,7 +558,7 @@ def revenue():
 
 @app.get("/stats")
 def stats():
-    check_closed_signals()
+    update_performance()
     accuracy = round(performance["wins"] / performance["total"] * 100, 1) if performance["total"] > 0 else 0
     return {
         "accuracy": f"{accuracy}%", "total_signals": performance["total"], "wins": performance["wins"],
@@ -574,7 +569,7 @@ def stats():
 @app.get("/reputation")
 def reputation():
     score = min(100, performance["wins"] * 2)
-    return {"reputation_score": score, "grade": get_confidence_grade(score)}
+    return {"reputation_score": score, "grade": grade(score)}
 
 @app.get("/agent/memory")
 def get_memory():
@@ -582,7 +577,7 @@ def get_memory():
 
 @app.get("/demo")
 def demo():
-    run_scanner()
+    scan_all()
     signals = [s for s in cache["signals"].values() if s["confidence"] > 0]
     if not signals: return {"error": "No signals"}
     best = max(signals, key=lambda x: x["confidence"])
@@ -610,6 +605,6 @@ def capabilities():
 @app.get("/cap/health")
 def cap_health():
     return {"agent": "CROO AI Oracle", "status": "active", "assets": ASSETS,
-            "data_sources": ["Binance", "MEXC", "CoinGecko", "Alternative.me"], 
+            "data_sources": ["Binance", "MEXC", "CoinGecko", "Alternative.me"],
             "uptime_seconds": int(time.time() - start_time),
-            "market_regime": cache["market_regime"], "fear_greed
+            "market_regime": cache["market_regime"], "fear_greed": cache["fear_greed"], "version": "10.0"}
