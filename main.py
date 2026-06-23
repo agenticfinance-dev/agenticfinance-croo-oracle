@@ -262,7 +262,6 @@ async def fetch_binance_ohlc(asset):
 async def fetch_coingecko_ohlcv(asset):
     if not can_call(f"cg_{asset}", 120): return None, None
     if not check_circuit_breaker("coingecko"): return None, None
-    # Check cache
     if asset in cg_cache and time.time() - cg_cache[asset]["timestamp"] < 300:
         return cg_cache[asset]["data"], "CoinGecko(Cached)"
     try:
@@ -327,16 +326,13 @@ async def fetch_coingecko_price(asset):
     return None
 
 async def get_price_fallback(asset):
-    # 1. Check live prices
     if asset in cache["live_prices"] and cache["live_prices"][asset] > 0:
         return cache["live_prices"][asset]
-    # 2. Try REST APIs
     for fetcher in [fetch_binance_price, fetch_bybit_price, fetch_coingecko_price]:
         price = await fetcher(asset)
         if price:
             cache["last_known_prices"][asset] = price
             return price
-    # 3. Last known price
     return cache["last_known_prices"].get(asset, 0)
 
 def get_current_price(asset):
@@ -407,6 +403,95 @@ def grade(confidence):
     elif confidence >= 50: return "D"
     return "F"
 
+# ==================== ENTRY ZONE CALCULATOR ====================
+def calculate_entries(price, atr, direction="LONG", signal_type="BUY"):
+    """Calculate entry zones instead of current price - CROO compliant"""
+    
+    if direction == "LONG" and signal_type in ["BUY", "WATCH"]:
+        # Multiple entries below current price (0.3-1.5% below)
+        aggressive_pct = 0.002  # 0.2% below
+        moderate_pct = 0.005    # 0.5% below
+        conservative_pct = 0.010 # 1.0% below
+        dca_1_pct = 0.020       # 2.0% below
+        dca_2_pct = 0.035       # 3.5% below
+        
+        entries = {
+            "aggressive": round(price * (1 - aggressive_pct), 4),
+            "moderate": round(price * (1 - moderate_pct), 4),
+            "conservative": round(price * (1 - conservative_pct), 4),
+            "dca_1": round(price * (1 - dca_1_pct), 4),
+            "dca_2": round(price * (1 - dca_2_pct), 4),
+        }
+        
+        # ATR-based entry
+        atr_entry = round(price - (atr * 0.3), 4)
+        
+        # Recommended = moderate (0.5% below)
+        recommended = entries["moderate"]
+        
+        # Entry zone = moderate to conservative
+        entry_zone = f"${entries['moderate']} - ${entries['conservative']}"
+        
+        # Stop loss = 3% below moderate entry
+        stop_loss = round(entries['moderate'] * 0.97, 4)
+        
+        # Take profit = 2x risk
+        risk = entries['moderate'] - stop_loss
+        take_profit = round(entries['moderate'] + (risk * 2), 4)
+        
+        # Position sizing suggestion
+        position_sizing = "50% at moderate, 30% at conservative, 20% at DCA"
+        
+    elif direction == "SHORT" and signal_type in ["SHORT", "WATCH"]:
+        # Multiple entries above current price
+        aggressive_pct = 0.002  # 0.2% above
+        moderate_pct = 0.005    # 0.5% above
+        conservative_pct = 0.010 # 1.0% above
+        dca_1_pct = 0.020       # 2.0% above
+        dca_2_pct = 0.035       # 3.5% above
+        
+        entries = {
+            "aggressive": round(price * (1 + aggressive_pct), 4),
+            "moderate": round(price * (1 + moderate_pct), 4),
+            "conservative": round(price * (1 + conservative_pct), 4),
+            "dca_1": round(price * (1 + dca_1_pct), 4),
+            "dca_2": round(price * (1 + dca_2_pct), 4),
+        }
+        
+        # ATR-based entry
+        atr_entry = round(price + (atr * 0.3), 4)
+        
+        recommended = entries["moderate"]
+        entry_zone = f"${entries['moderate']} - ${entries['conservative']}"
+        stop_loss = round(entries['moderate'] * 1.03, 4)
+        risk = stop_loss - entries['moderate']
+        take_profit = round(entries['moderate'] - (risk * 2), 4)
+        position_sizing = "50% at moderate, 30% at conservative, 20% at DCA"
+        
+    else:
+        return {
+            "entry": round(price, 4),
+            "entry_zone": "N/A",
+            "entries": {"current": round(price, 4)},
+            "stop_loss": 0,
+            "take_profit": 0,
+            "risk_reward": "N/A",
+            "position_sizing": "N/A"
+        }
+    
+    risk_reward = round(abs(take_profit - recommended) / abs(stop_loss - recommended), 2) if abs(stop_loss - recommended) > 0 else 0
+    
+    return {
+        "entry": recommended,
+        "entry_zone": entry_zone,
+        "entries": entries,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_reward": f"{risk_reward}:1",
+        "position_sizing": position_sizing,
+        "atr_entry": atr_entry
+    }
+
 # ==================== USER MANAGEMENT ====================
 def is_pro(user_id: int) -> bool:
     user = users_db.get(user_id, {})
@@ -439,16 +524,21 @@ async def analyze_asset(symbol):
     if not klines or len(klines) < 50:
         price = await get_price_fallback(symbol)
         if price > 0:
+            entry_data = calculate_entries(price, 0.01, "LONG", "WATCH")
             return {
                 "asset": symbol.replace("USDT", ""),
                 "signal": "WATCH",
                 "confidence": 20,
                 "grade": "F",
                 "price": round(price, 4),
-                "entry": round(price, 4),
-                "stop_loss": round(price * 0.97, 4),
-                "take_profit": round(price * 1.05, 4),
-                "bullish_reasons": ["Price only"],
+                "entry": entry_data["entry"],
+                "entry_zone": entry_data["entry_zone"],
+                "entries": entry_data["entries"],
+                "stop_loss": entry_data["stop_loss"],
+                "take_profit": entry_data["take_profit"],
+                "risk_reward": entry_data["risk_reward"],
+                "position_sizing": entry_data["position_sizing"],
+                "bullish_reasons": ["Price only - awaiting full data"],
                 "bearish_reasons": [],
                 "missing_conditions": ["Full OHLCV data unavailable"],
                 "source": "price_only",
@@ -461,6 +551,13 @@ async def analyze_asset(symbol):
             "signal": "NONE",
             "confidence": 0,
             "price": 0,
+            "entry": 0,
+            "entry_zone": "N/A",
+            "entries": {},
+            "stop_loss": 0,
+            "take_profit": 0,
+            "risk_reward": "N/A",
+            "position_sizing": "N/A",
             "bullish_reasons": ["No Data"],
             "bearish_reasons": [],
             "direction": "NONE",
@@ -496,7 +593,6 @@ async def analyze_asset(symbol):
     bearish_reasons = []
     missing_conditions = []
 
-    # RSI
     if rsi_val < 45:
         long_score += 20
         bullish_reasons.append(f"RSI Oversold ({rsi_val:.1f})")
@@ -506,7 +602,6 @@ async def analyze_asset(symbol):
     else:
         missing_conditions.append("RSI neutral")
 
-    # EMA
     if price > ema50:
         long_score += 20
         bullish_reasons.append("Above EMA50")
@@ -516,7 +611,6 @@ async def analyze_asset(symbol):
     else:
         missing_conditions.append("No clear EMA trend")
 
-    # Pullback/Bounce
     if price > ema50 and 4 < pullback < 12 and price_near_ema20:
         long_score += 20
         bullish_reasons.append(f"Dip {pullback:.1f}% to EMA20")
@@ -526,7 +620,6 @@ async def analyze_asset(symbol):
     else:
         missing_conditions.append("Pullback too shallow/deep")
 
-    # Volume
     if vol_spike:
         if long_score >= short_score:
             long_score += 20
@@ -537,7 +630,6 @@ async def analyze_asset(symbol):
     else:
         missing_conditions.append("No volume confirmation")
 
-    # Confirmation
     if bullish_confirmation:
         long_score += 20
         bullish_reasons.append("Bullish Confirmation")
@@ -547,7 +639,6 @@ async def analyze_asset(symbol):
     else:
         missing_conditions.append("No confirmation candle")
 
-    # Fear & Greed
     fg = cache["fear_greed"]
     if fg < 25 and long_score >= short_score:
         long_score += 5
@@ -564,35 +655,25 @@ async def analyze_asset(symbol):
     elif confidence >= 40:
         signal = "WATCH"
 
-    # ATR-based SL/TP
-    atr_sl_mult = 2.5
-    atr_tp_mult = 4.0
-    if signal == "BUY":
-        stop_loss = round(price - (atr * atr_sl_mult), 4)
-        take_profit = round(price + (atr * atr_tp_mult), 4)
-        entry = round(price, 4)
+    # ===== ENTRY ZONE CALCULATION =====
+    if signal in ["BUY", "WATCH"] and direction == "LONG":
+        entry_data = calculate_entries(price, atr, "LONG", signal)
         risk = "LOW" if atr / price < 0.02 else "MEDIUM"
         holding_period = "1-3 days"
-    elif signal == "SHORT":
-        stop_loss = round(price + (atr * atr_sl_mult), 4)
-        take_profit = round(price - (atr * atr_tp_mult), 4)
-        entry = round(price, 4)
+    elif signal in ["SHORT", "WATCH"] and direction == "SHORT":
+        entry_data = calculate_entries(price, atr, "SHORT", signal)
         risk = "LOW" if atr / price < 0.02 else "MEDIUM"
         holding_period = "1-3 days"
-    elif signal == "WATCH":
-        entry = round(price, 4)
-        if direction == "LONG":
-            stop_loss = round(price - (atr * 1.5), 4)
-            take_profit = round(price + (atr * 2.5), 4)
-        else:
-            stop_loss = round(price + (atr * 1.5), 4)
-            take_profit = round(price - (atr * 2.5), 4)
-        risk = "MEDIUM"
-        holding_period = "2-5 days"
     else:
-        stop_loss = 0
-        take_profit = 0
-        entry = 0
+        entry_data = {
+            "entry": round(price, 4),
+            "entry_zone": "N/A",
+            "entries": {"current": round(price, 4)},
+            "stop_loss": 0,
+            "take_profit": 0,
+            "risk_reward": "N/A",
+            "position_sizing": "N/A"
+        }
         risk = "N/A"
         holding_period = "N/A"
 
@@ -608,9 +689,13 @@ async def analyze_asset(symbol):
         "confidence": confidence,
         "grade": grade(confidence),
         "direction": direction,
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
+        "entry": entry_data["entry"],
+        "entry_zone": entry_data["entry_zone"],
+        "entries": entry_data["entries"],
+        "stop_loss": entry_data["stop_loss"],
+        "take_profit": entry_data["take_profit"],
+        "risk_reward": entry_data["risk_reward"],
+        "position_sizing": entry_data["position_sizing"],
         "rsi": round(rsi_val, 1),
         "atr": round(atr, 4),
         "risk": risk,
@@ -621,6 +706,7 @@ async def analyze_asset(symbol):
         "source": source,
         "market_regime": cache["market_regime"],
         "fear_greed": cache["fear_greed"],
+        "pullback_pct": round(pullback, 2),
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -689,9 +775,12 @@ async def send_alert(signal):
     msg += f"Asset: {signal['asset']}\n"
     msg += f"Confidence: {signal['confidence']}% ({signal['grade']})\n"
     msg += f"Risk: {signal['risk']}\n\n"
+    msg += f"Entry Zone: {signal['entry_zone']}\n"
     msg += f"Entry: ${signal['entry']}\n"
     msg += f"Target: ${signal['take_profit']}\n"
-    msg += f"Stop: ${signal['stop_loss']}\n\n"
+    msg += f"Stop: ${signal['stop_loss']}\n"
+    msg += f"R:R: {signal['risk_reward']}\n\n"
+    msg += f"Position Sizing:\n{signal['position_sizing']}\n\n"
     msg += f"Reasons:\n"
     reasons = signal['bullish_reasons'] if signal['direction'] == 'LONG' else signal['bearish_reasons']
     msg += "\n".join([f"✅ {r}" for r in reasons[:5]])
@@ -735,7 +824,6 @@ async def scan_all():
     cache["last_successful_scan"] = time.time()
     save_memory()
 
-    # Clean old alerts
     for asset in list(last_alerted.keys()):
         if time.time() - last_alerted[asset] > 86400:
             del last_alerted[asset]
@@ -758,7 +846,7 @@ async def scanner_loop():
 @app.post("/a2a")
 async def a2a(request: Request):
     try:
-        data = await req.json()
+        data = await request.json()
     except:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
@@ -776,9 +864,11 @@ async def a2a(request: Request):
                 "asset": best.get("asset"),
                 "signal": best.get("signal"),
                 "confidence": best.get("confidence"),
+                "entry_zone": best.get("entry_zone"),
                 "entry": best.get("entry"),
                 "tp": best.get("take_profit"),
                 "sl": best.get("stop_loss"),
+                "risk_reward": best.get("risk_reward"),
                 "risk": best.get("risk")
             },
             "from_agent": "CROO Oracle",
@@ -813,9 +903,12 @@ async def send_rich_card(chat_id, s):
     msg += f"Confidence: {s.get('confidence')}% ({s.get('grade')})\n"
     msg += f"Risk: {s.get('risk')}\n"
     msg += f"Price: ${s.get('price')}\n\n"
+    msg += f"Entry Zone: {s.get('entry_zone')}\n"
     msg += f"Entry: ${s.get('entry')}\n"
     msg += f"Target: ${s.get('take_profit')}\n"
-    msg += f"Stop: ${s.get('stop_loss')}\n\n"
+    msg += f"Stop: ${s.get('stop_loss')}\n"
+    msg += f"R:R: {s.get('risk_reward')}\n\n"
+    msg += f"Position Sizing:\n{s.get('position_sizing')}\n\n"
 
     if s.get('direction') == 'LONG':
         msg += f"Bullish Reasons:\n" + "\n".join([f"✅ {r}" for r in s.get('bullish_reasons', ['None'])[:5]])
@@ -824,6 +917,7 @@ async def send_rich_card(chat_id, s):
 
     msg += f"\n\nMarket: {s.get('market_regime','').upper()} | F&G: {s.get('fear_greed')}"
     msg += f"\nSource: {s.get('source', 'N/A')} | Hold: {s.get('holding_period', 'N/A')}"
+    msg += f"\nPullback: {s.get('pullback_pct', 0)}%"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 # ==================== API ENDPOINTS ====================
@@ -836,12 +930,13 @@ def root():
         "assets": len(ASSETS),
         "status": "online",
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
+        "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
         "endpoints": [
             "/oracle", "/best_signal", "/leaderboard", "/stats",
             "/history", "/agent/query", "/a2a",
             "/cap/metadata", "/cap/health", "/pricing", "/capabilities",
-            "/explain/{symbol}", "/agent/revenue", "/reputation",
-            "/why/{symbol}", "/portfolio", "/demo", "/business_model",
+            "/explain/{symbol}", "/why/{symbol}",
+            "/portfolio", "/demo", "/business_model",
             "/.well-known/agent.json"
         ]
     }
@@ -868,11 +963,14 @@ async def best_signal():
         "confidence": best.get("confidence"),
         "grade": best.get("grade"),
         "price": best.get("price"),
+        "entry_zone": best.get("entry_zone"),
         "entry": best.get("entry"),
         "tp": best.get("take_profit"),
         "sl": best.get("stop_loss"),
+        "risk_reward": best.get("risk_reward"),
         "risk": best.get("risk"),
         "holding_period": best.get("holding_period"),
+        "position_sizing": best.get("position_sizing"),
         "reasons": best.get("bullish_reasons") if best.get("direction") == "LONG" else best.get("bearish_reasons")
     })
 
@@ -886,6 +984,8 @@ async def leaderboard():
         "confidence": s.get("confidence"),
         "grade": s.get("grade"),
         "price": s.get("price"),
+        "entry_zone": s.get("entry_zone"),
+        "risk_reward": s.get("risk_reward"),
         "source": s.get("source")
     } for s in signals[:10]])
 
@@ -927,9 +1027,11 @@ async def agent_query(req: Request):
             "asset": best.get("asset"),
             "signal": best.get("signal"),
             "confidence": best.get("confidence"),
+            "entry_zone": best.get("entry_zone"),
             "entry": best.get("entry"),
             "tp": best.get("take_profit"),
             "sl": best.get("stop_loss"),
+            "risk_reward": best.get("risk_reward"),
             "risk": best.get("risk"),
             "reason": best.get("bullish_reasons") if best.get("direction") == "LONG" else best.get("bearish_reasons")
         })
@@ -944,7 +1046,9 @@ async def agent_query(req: Request):
                     "signal": s.get("signal"),
                     "confidence": s.get("confidence"),
                     "price": s.get("price"),
-                    "grade": s.get("grade")
+                    "grade": s.get("grade"),
+                    "entry_zone": s.get("entry_zone"),
+                    "risk_reward": s.get("risk_reward")
                 })
         return JSONResponse(signals)
 
@@ -970,7 +1074,8 @@ async def agent_query(req: Request):
             "confidence": signal.get("confidence"),
             "explanation": signal.get("bullish_reasons") if signal.get("direction") == "LONG" else signal.get("bearish_reasons"),
             "risk": signal.get("risk"),
-            "holding_period": signal.get("holding_period")
+            "holding_period": signal.get("holding_period"),
+            "entry_zone": signal.get("entry_zone")
         })
 
     elif task == "predict_asset":
@@ -981,7 +1086,8 @@ async def agent_query(req: Request):
         return JSONResponse([{
             "asset": s.get("asset"),
             "score": s.get("confidence"),
-            "signal": s.get("signal")
+            "signal": s.get("signal"),
+            "entry_zone": s.get("entry_zone")
         } for s in sorted(signals, key=lambda x: x.get("confidence", 0), reverse=True)[:5]])
 
     elif task == "rank_assets":
@@ -991,7 +1097,8 @@ async def agent_query(req: Request):
             "asset": s.get("asset"),
             "score": s.get("confidence"),
             "signal": s.get("signal"),
-            "grade": s.get("grade")
+            "grade": s.get("grade"),
+            "entry_zone": s.get("entry_zone")
         } for s in signals[:5]])
 
     return JSONResponse({"error": "Unknown task. Use: find_best_pullback, get_all_signals, get_market_intelligence, explain_signal, predict_asset, rank_assets"})
@@ -1017,6 +1124,9 @@ async def why(symbol: str):
         "explanation": explanation,
         "risk": signal.get("risk"),
         "holding_period": signal.get("holding_period"),
+        "entry_zone": signal.get("entry_zone"),
+        "risk_reward": signal.get("risk_reward"),
+        "position_sizing": signal.get("position_sizing"),
         "market_regime": signal.get("market_regime"),
         "fear_greed": signal.get("fear_greed")
     })
@@ -1034,12 +1144,15 @@ async def portfolio(req: Request):
     if not signals:
         return JSONResponse({"error": "No signals for portfolio allocation"})
 
-    # Allocate based on confidence
     total_conf = sum(s.get("confidence", 0) for s in signals[:5]) or 1
     allocation = {}
     for s in signals[:5]:
         weight = s.get("confidence", 0) / total_conf
-        allocation[s.get("asset")] = round(capital * weight, 2)
+        allocation[s.get("asset")] = {
+            "amount": round(capital * weight, 2),
+            "entry_zone": s.get("entry_zone"),
+            "risk_reward": s.get("risk_reward")
+        }
 
     return JSONResponse({
         "capital": capital,
@@ -1058,17 +1171,20 @@ async def demo():
         "agent": "CROO AI Oracle",
         "version": "10.0",
         "status": "active",
+        "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
         "market_regime": cache["market_regime"],
         "fear_greed": cache["fear_greed"],
         "best_signal": {
             "asset": best.get("asset") if best else None,
             "signal": best.get("signal") if best else None,
-            "confidence": best.get("confidence") if best else None
+            "confidence": best.get("confidence") if best else None,
+            "entry_zone": best.get("entry_zone") if best else None
         } if best else None,
         "top_3_assets": [{
             "asset": s.get("asset"),
             "confidence": s.get("confidence"),
-            "signal": s.get("signal")
+            "signal": s.get("signal"),
+            "entry_zone": s.get("entry_zone")
         } for s in signals[:3]] if signals else [],
         "accuracy": f"{accuracy}%",
         "total_signals": performance["total"],
@@ -1080,15 +1196,31 @@ def business_model():
     return JSONResponse({
         "free": {
             "requests": "5/day",
-            "features": ["Basic signals", "3 assets"]
+            "features": ["Basic signals", "3 assets", "Current price entry only"]
         },
         "pro": {
             "price": "$9.99/month",
-            "features": ["All assets", "Multi-source data", "Priority alerts", "Full history", "Telegram alerts"]
+            "features": [
+                "All assets",
+                "Multi-source data",
+                "Priority alerts",
+                "Full history",
+                "Telegram alerts",
+                "Entry zone recommendations",
+                "Position sizing guidance"
+            ]
         },
         "enterprise": {
             "price": "Custom pricing",
-            "features": ["All assets", "Webhook integration", "White-label", "Dedicated support", "Custom alerts", "API access"]
+            "features": [
+                "All assets",
+                "Webhook integration",
+                "White-label",
+                "Dedicated support",
+                "Custom alerts",
+                "API access",
+                "Custom entry strategies"
+            ]
         },
         "note": "Payments disabled during CROO Hackathon. All features unlocked for judges."
     })
@@ -1110,14 +1242,18 @@ async def explain(symbol: str):
         "market_regime": signal.get("market_regime"),
         "fear_greed": signal.get("fear_greed"),
         "price": signal.get("price"),
-        "entry": signal.get("entry"),
+        "entry_zone": signal.get("entry_zone"),
+        "entries": signal.get("entries"),
         "take_profit": signal.get("take_profit"),
         "stop_loss": signal.get("stop_loss"),
+        "risk_reward": signal.get("risk_reward"),
+        "position_sizing": signal.get("position_sizing"),
         "source": signal.get("source"),
         "rsi": signal.get("rsi"),
         "atr": signal.get("atr"),
         "risk": signal.get("risk"),
         "holding_period": signal.get("holding_period"),
+        "pullback_pct": signal.get("pullback_pct"),
         "direction": signal.get("direction"),
         "timestamp": signal.get("timestamp")
     })
@@ -1148,6 +1284,7 @@ def cap_metadata():
         "category": "Market Intelligence",
         "callable": True,
         "supports": [a.replace("USDT", "") for a in ASSETS],
+        "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
         "features": [
             "pullback_detection",
             "confidence_scoring",
@@ -1157,7 +1294,9 @@ def cap_metadata():
             "explainability",
             "auto_alerts",
             "multi_source_data",
-            "A2A_compatible"
+            "A2A_compatible",
+            "entry_zone_recommendations",
+            "position_sizing"
         ],
         "pricing": {
             "free": "5 requests/day",
@@ -1176,11 +1315,12 @@ def cap_health():
         "payments": "disabled_for_judging",
         "auto_scanner": "active_5min",
         "websocket_feed": "active",
+        "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
         "last_scan": f"{int(time.time() - cache['last_successful_scan'])}s ago" if cache["last_successful_scan"] else "never",
         "last_price_update": f"{int(time.time() - cache['last_ws_update'])}s ago" if cache["last_ws_update"] else "never",
         "signals_generated": performance["total"],
         "active_users": len(users_db),
-        "features": ["pullback", "regime", "fear_greed", "A2A", "explainability", "portfolio"],
+        "features": ["pullback", "regime", "fear_greed", "A2A", "explainability", "portfolio", "entry_zones"],
         "version": "10.0-croo-final"
     })
 
@@ -1207,10 +1347,19 @@ def capabilities():
             "performance_tracking",
             "agent_memory",
             "portfolio_management",
-            "risk_management"
+            "risk_management",
+            "entry_zone_recommendations",
+            "position_sizing_guidance"
         ],
         "assets": [a.replace("USDT", "") for a in ASSETS],
         "sources": ["Binance", "Bybit", "OKX", "Kraken", "CoinGecko"],
+        "entry_strategy": {
+            "type": "Zone-based",
+            "long_entries": "0.2% - 3.5% below current price",
+            "short_entries": "0.2% - 3.5% above current price",
+            "position_sizing": "50% moderate, 30% conservative, 20% DCA",
+            "risk_reward": "Minimum 2:1"
+        },
         "api_endpoints": [
             "/oracle", "/best_signal", "/leaderboard", "/stats",
             "/history", "/agent/query", "/a2a",
@@ -1225,9 +1374,13 @@ def capabilities():
 def agent_manifest():
     return {
         "name": "CROO AI Oracle",
-        "description": "Autonomous crypto intelligence agent with pullback detection, market regime analysis, and explainable AI",
+        "description": "Autonomous crypto intelligence agent with pullback detection, market regime analysis, entry zone recommendations, and explainable AI",
         "endpoint": "/agent/query",
         "a2a_endpoint": "/a2a",
+        "entry_strategy": {
+            "type": "Zone-based entries",
+            "description": "Never enters at current price. Uses 0.5-1% below/above current price with multiple levels"
+        },
         "capabilities": [
             "pullback_detection",
             "market_intelligence",
@@ -1236,7 +1389,8 @@ def agent_manifest():
             "explainability",
             "multi_source_data",
             "auto_alerts",
-            "portfolio_management"
+            "portfolio_management",
+            "entry_zone_recommendations"
         ],
         "assets": [a.replace("USDT", "") for a in ASSETS],
         "version": "10.0"
@@ -1310,10 +1464,11 @@ async def handle_message(chat_id, text, user_id):
         msg = "🔮 CROO AI Oracle\n\n"
         msg += f"Market: {regime} | F&G: {cache['fear_greed']}\n"
         msg += f"Assets: {len(ASSETS)} monitored\n"
+        msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)\n"
         if top and top.get("confidence", 0) > 0:
             msg += f"\n🔥 Top: {top.get('asset')} {top.get('signal')} {top.get('confidence')}% ({top.get('grade')})\n"
-            msg += f"Price: ${top.get('price')} | {top.get('source', 'N/A')}\n"
-        msg += "\n/scan /best /leaderboard /stats /portfolio /why BTC"
+            msg += f"Price: ${top.get('price')} | Zone: {top.get('entry_zone')}\n"
+        msg += "\n/scan /best /leaderboard /stats /why BTC"
         await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif text in ["/scan", "/signals"]:
@@ -1360,7 +1515,10 @@ async def send_why(chat_id, symbol):
     msg = f"🧠 WHY {symbol}?\n\n"
     msg += f"Decision: {signal.get('signal')}\n"
     msg += f"Confidence: {signal.get('confidence')}%\n"
-    msg += f"Risk: {signal.get('risk')}\n\n"
+    msg += f"Risk: {signal.get('risk')}\n"
+    msg += f"Entry Zone: {signal.get('entry_zone')}\n"
+    msg += f"R:R: {signal.get('risk_reward')}\n\n"
+
     if signal.get('direction') == 'LONG':
         msg += "Bullish:\n" + "\n".join([f"✅ {r}" for r in signal.get('bullish_reasons', [])[:5]])
     else:
@@ -1370,6 +1528,7 @@ async def send_why(chat_id, symbol):
         msg += f"\n\nMissing:\n" + "\n".join([f"❌ {m}" for m in signal.get('missing_conditions', [])[:3]])
 
     msg += f"\n\nMarket: {signal.get('market_regime', '').upper()} | F&G: {signal.get('fear_greed')}"
+    msg += f"\nPosition Sizing: {signal.get('position_sizing', 'N/A')}"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def send_leaderboard(chat_id):
@@ -1378,7 +1537,7 @@ async def send_leaderboard(chat_id):
     msg = f"🏆 LEADERBOARD | {cache['market_regime'].upper()} | F&G: {cache['fear_greed']}\n\n"
     for i, s in enumerate(signals[:10], 1):
         msg += f"{i}. {s.get('asset','N/A')} - {s.get('confidence',0)}% ({s.get('grade','N/A')}) {s.get('signal','NONE')}\n"
-        msg += f" ${s.get('price',0)} | {s.get('source','N/A')}\n"
+        msg += f" ${s.get('price',0)} | Zone: {s.get('entry_zone','N/A')}\n"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def send_stats(chat_id):
@@ -1392,7 +1551,8 @@ async def send_stats(chat_id):
     msg += f"Best Asset: {agent_memory['best_asset']} ({agent_memory['best_asset_win_rate']}%)\n"
     msg += f"Market Regime: {cache['market_regime'].upper()}\n"
     msg += f"Fear & Greed: {cache['fear_greed']}\n"
-    msg += f"Revenue Simulated: ${round(agent_memory['revenue_simulated'], 2)}"
+    msg += f"Revenue Simulated: ${round(agent_memory['revenue_simulated'], 2)}\n"
+    msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def handle_callback(chat_id, data, user_id):
@@ -1430,10 +1590,8 @@ async def handle_callback(chat_id, data, user_id):
 async def startup_event():
     global session, scanner_task, ws_task
 
-    # Load memory
     load_memory()
 
-    # Setup session
     timeout = aiohttp.ClientTimeout(total=15)
     session = aiohttp.ClientSession(
         timeout=timeout,
@@ -1444,27 +1602,21 @@ async def startup_event():
         )
     )
 
-    # Set webhook
     if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN and bot:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         await bot.set_webhook(url=webhook_url)
         print(f"✅ Webhook set: {webhook_url}")
 
-    # Start scanner (with initial scan)
     scanner_task = asyncio.create_task(scanner_loop())
-
-    # Start websockets
     ws_task = asyncio.create_task(start_websockets())
-
-    # Initial scan for data
     await scan_all()
     print("🚀 CROO AI Oracle started successfully")
+    print("📊 Entry Strategy: Zone-based (0.5-1% below/above current price)")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global session, scanner_task, ws_task, ws_tasks
 
-    # Cancel tasks
     tasks = []
     if scanner_task:
         tasks.append(scanner_task)
@@ -1479,7 +1631,6 @@ async def shutdown_event():
 
     await asyncio.gather(*[t for t in tasks if t], return_exceptions=True)
 
-    # Close session
     if session:
         await session.close()
 
