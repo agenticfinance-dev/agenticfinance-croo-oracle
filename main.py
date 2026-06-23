@@ -403,69 +403,86 @@ def grade(confidence):
     elif confidence >= 50: return "D"
     return "F"
 
-# ==================== ENTRY ZONE CALCULATOR ====================
+# ==================== ENTRY ZONE CALCULATOR (REALISTIC TPs) ====================
 def calculate_entries(price, atr, direction="LONG", signal_type="BUY"):
-    """Calculate entry zones instead of current price - CROO compliant"""
+    """Calculate entry zones with realistic take profits (3-6%)"""
     
     if direction == "LONG" and signal_type in ["BUY", "WATCH"]:
-        # Multiple entries below current price (0.3-1.5% below)
-        aggressive_pct = 0.002  # 0.2% below
-        moderate_pct = 0.005    # 0.5% below
-        conservative_pct = 0.010 # 1.0% below
-        dca_1_pct = 0.020       # 2.0% below
-        dca_2_pct = 0.035       # 3.5% below
-        
+        # Entry levels below current price
         entries = {
-            "aggressive": round(price * (1 - aggressive_pct), 4),
-            "moderate": round(price * (1 - moderate_pct), 4),
-            "conservative": round(price * (1 - conservative_pct), 4),
-            "dca_1": round(price * (1 - dca_1_pct), 4),
-            "dca_2": round(price * (1 - dca_2_pct), 4),
+            "aggressive": round(price * 0.998, 4),   # 0.2% below
+            "moderate": round(price * 0.995, 4),     # 0.5% below (recommended)
+            "conservative": round(price * 0.990, 4), # 1.0% below
+            "dca_1": round(price * 0.980, 4),        # 2.0% below
+            "dca_2": round(price * 0.965, 4),        # 3.5% below
         }
         
-        # ATR-based entry
-        atr_entry = round(price - (atr * 0.3), 4)
-        
-        # Recommended = moderate (0.5% below)
         recommended = entries["moderate"]
-        
-        # Entry zone = moderate to conservative
         entry_zone = f"${entries['moderate']} - ${entries['conservative']}"
         
-        # Stop loss = 3% below moderate entry
-        stop_loss = round(entries['moderate'] * 0.97, 4)
+        # ===== REALISTIC STOP LOSS =====
+        # Use ATR-based stop loss (2x ATR) with minimum 2.5%
+        atr_stop = max(price * 0.025, atr * 2)
+        stop_loss = round(recommended - atr_stop, 4)
         
-        # Take profit = 2x risk
-        risk = entries['moderate'] - stop_loss
-        take_profit = round(entries['moderate'] + (risk * 2), 4)
+        # ===== REALISTIC TAKE PROFIT =====
+        # Calculate risk
+        risk = recommended - stop_loss
         
-        # Position sizing suggestion
+        # Option 1: 1.5x to 2.5x risk (1.5:1 to 2.5:1 R:R)
+        tp_1 = round(recommended + (risk * 1.5), 4)  # 1.5x risk
+        tp_2 = round(recommended + (risk * 2.0), 4)  # 2.0x risk
+        tp_3 = round(recommended + (risk * 2.5), 4)  # 2.5x risk
+        
+        # Option 2: Fixed percentage based on volatility (max 6%)
+        volatility_factor = min(0.06, atr / price * 4)  # Max 6%
+        tp_fixed = round(recommended * (1 + volatility_factor), 4)
+        
+        # Use risk-based TP, capped by volatility
+        take_profit = min(tp_3, tp_fixed)
+        
+        # Ensure minimum 2% gain
+        take_profit = max(take_profit, round(recommended * 1.02, 4))
+        
+        # Recalculate R:R
+        risk = recommended - stop_loss
+        reward = take_profit - recommended
+        risk_reward = round(reward / risk, 2) if risk > 0 else 0
+        
         position_sizing = "50% at moderate, 30% at conservative, 20% at DCA"
         
     elif direction == "SHORT" and signal_type in ["SHORT", "WATCH"]:
-        # Multiple entries above current price
-        aggressive_pct = 0.002  # 0.2% above
-        moderate_pct = 0.005    # 0.5% above
-        conservative_pct = 0.010 # 1.0% above
-        dca_1_pct = 0.020       # 2.0% above
-        dca_2_pct = 0.035       # 3.5% above
-        
+        # Entry levels above current price
         entries = {
-            "aggressive": round(price * (1 + aggressive_pct), 4),
-            "moderate": round(price * (1 + moderate_pct), 4),
-            "conservative": round(price * (1 + conservative_pct), 4),
-            "dca_1": round(price * (1 + dca_1_pct), 4),
-            "dca_2": round(price * (1 + dca_2_pct), 4),
+            "aggressive": round(price * 1.002, 4),   # 0.2% above
+            "moderate": round(price * 1.005, 4),     # 0.5% above
+            "conservative": round(price * 1.010, 4), # 1.0% above
+            "dca_1": round(price * 1.020, 4),        # 2.0% above
+            "dca_2": round(price * 1.035, 4),        # 3.5% above
         }
-        
-        # ATR-based entry
-        atr_entry = round(price + (atr * 0.3), 4)
         
         recommended = entries["moderate"]
         entry_zone = f"${entries['moderate']} - ${entries['conservative']}"
-        stop_loss = round(entries['moderate'] * 1.03, 4)
-        risk = stop_loss - entries['moderate']
-        take_profit = round(entries['moderate'] - (risk * 2), 4)
+        
+        # ===== REALISTIC STOP LOSS =====
+        atr_stop = max(price * 0.025, atr * 2)
+        stop_loss = round(recommended + atr_stop, 4)
+        
+        # ===== REALISTIC TAKE PROFIT =====
+        risk = stop_loss - recommended
+        
+        tp_1 = round(recommended - (risk * 1.5), 4)
+        tp_2 = round(recommended - (risk * 2.0), 4)
+        tp_3 = round(recommended - (risk * 2.5), 4)
+        
+        volatility_factor = min(0.06, atr / price * 4)
+        tp_fixed = round(recommended * (1 - volatility_factor), 4)
+        
+        take_profit = max(tp_3, tp_fixed)
+        take_profit = min(take_profit, round(recommended * 0.98, 4))  # At least 2% gain
+        
+        reward = recommended - take_profit
+        risk_reward = round(reward / risk, 2) if risk > 0 else 0
         position_sizing = "50% at moderate, 30% at conservative, 20% at DCA"
         
     else:
@@ -479,8 +496,6 @@ def calculate_entries(price, atr, direction="LONG", signal_type="BUY"):
             "position_sizing": "N/A"
         }
     
-    risk_reward = round(abs(take_profit - recommended) / abs(stop_loss - recommended), 2) if abs(stop_loss - recommended) > 0 else 0
-    
     return {
         "entry": recommended,
         "entry_zone": entry_zone,
@@ -488,8 +503,7 @@ def calculate_entries(price, atr, direction="LONG", signal_type="BUY"):
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "risk_reward": f"{risk_reward}:1",
-        "position_sizing": position_sizing,
-        "atr_entry": atr_entry
+        "position_sizing": position_sizing
     }
 
 # ==================== USER MANAGEMENT ====================
@@ -544,7 +558,8 @@ async def analyze_asset(symbol):
                 "source": "price_only",
                 "direction": "NONE",
                 "risk": "HIGH",
-                "holding_period": "N/A"
+                "holding_period": "N/A",
+                "pullback_pct": 0
             }
         return {
             "asset": symbol.replace("USDT", ""),
@@ -562,7 +577,8 @@ async def analyze_asset(symbol):
             "bearish_reasons": [],
             "direction": "NONE",
             "risk": "UNKNOWN",
-            "holding_period": "N/A"
+            "holding_period": "N/A",
+            "pullback_pct": 0
         }
 
     closes = np.array([float(k[4]) for k in klines])
@@ -655,7 +671,7 @@ async def analyze_asset(symbol):
     elif confidence >= 40:
         signal = "WATCH"
 
-    # ===== ENTRY ZONE CALCULATION =====
+    # ===== ENTRY ZONE CALCULATION WITH REALISTIC TPs =====
     if signal in ["BUY", "WATCH"] and direction == "LONG":
         entry_data = calculate_entries(price, atr, "LONG", signal)
         risk = "LOW" if atr / price < 0.02 else "MEDIUM"
@@ -869,7 +885,8 @@ async def a2a(request: Request):
                 "tp": best.get("take_profit"),
                 "sl": best.get("stop_loss"),
                 "risk_reward": best.get("risk_reward"),
-                "risk": best.get("risk")
+                "risk": best.get("risk"),
+                "holding_period": best.get("holding_period")
             },
             "from_agent": "CROO Oracle",
             "to_agent": agent
@@ -931,6 +948,7 @@ def root():
         "status": "online",
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
         "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
+        "tp_strategy": "Realistic 3-6% take profits with 2:1 to 2.5:1 R:R",
         "endpoints": [
             "/oracle", "/best_signal", "/leaderboard", "/stats",
             "/history", "/agent/query", "/a2a",
@@ -960,6 +978,7 @@ async def best_signal():
     return JSONResponse({
         "asset": best.get("asset"),
         "signal": best.get("signal"),
+        "direction": best.get("direction"),
         "confidence": best.get("confidence"),
         "grade": best.get("grade"),
         "price": best.get("price"),
@@ -981,6 +1000,7 @@ async def leaderboard():
     return JSONResponse([{
         "asset": s.get("asset"),
         "signal": s.get("signal"),
+        "direction": s.get("direction"),
         "confidence": s.get("confidence"),
         "grade": s.get("grade"),
         "price": s.get("price"),
@@ -1026,6 +1046,7 @@ async def agent_query(req: Request):
         return JSONResponse({
             "asset": best.get("asset"),
             "signal": best.get("signal"),
+            "direction": best.get("direction"),
             "confidence": best.get("confidence"),
             "entry_zone": best.get("entry_zone"),
             "entry": best.get("entry"),
@@ -1033,6 +1054,7 @@ async def agent_query(req: Request):
             "sl": best.get("stop_loss"),
             "risk_reward": best.get("risk_reward"),
             "risk": best.get("risk"),
+            "holding_period": best.get("holding_period"),
             "reason": best.get("bullish_reasons") if best.get("direction") == "LONG" else best.get("bearish_reasons")
         })
 
@@ -1044,6 +1066,7 @@ async def agent_query(req: Request):
                 signals.append({
                     "asset": s.get("asset"),
                     "signal": s.get("signal"),
+                    "direction": s.get("direction"),
                     "confidence": s.get("confidence"),
                     "price": s.get("price"),
                     "grade": s.get("grade"),
@@ -1071,11 +1094,13 @@ async def agent_query(req: Request):
         return JSONResponse({
             "asset": signal.get("asset"),
             "decision": signal.get("signal"),
+            "direction": signal.get("direction"),
             "confidence": signal.get("confidence"),
             "explanation": signal.get("bullish_reasons") if signal.get("direction") == "LONG" else signal.get("bearish_reasons"),
             "risk": signal.get("risk"),
             "holding_period": signal.get("holding_period"),
-            "entry_zone": signal.get("entry_zone")
+            "entry_zone": signal.get("entry_zone"),
+            "risk_reward": signal.get("risk_reward")
         })
 
     elif task == "predict_asset":
@@ -1087,6 +1112,7 @@ async def agent_query(req: Request):
             "asset": s.get("asset"),
             "score": s.get("confidence"),
             "signal": s.get("signal"),
+            "direction": s.get("direction"),
             "entry_zone": s.get("entry_zone")
         } for s in sorted(signals, key=lambda x: x.get("confidence", 0), reverse=True)[:5]])
 
@@ -1097,6 +1123,7 @@ async def agent_query(req: Request):
             "asset": s.get("asset"),
             "score": s.get("confidence"),
             "signal": s.get("signal"),
+            "direction": s.get("direction"),
             "grade": s.get("grade"),
             "entry_zone": s.get("entry_zone")
         } for s in signals[:5]])
@@ -1120,6 +1147,7 @@ async def why(symbol: str):
     return JSONResponse({
         "asset": signal.get("asset"),
         "decision": signal.get("signal"),
+        "direction": signal.get("direction"),
         "confidence": signal.get("confidence"),
         "explanation": explanation,
         "risk": signal.get("risk"),
@@ -1151,7 +1179,8 @@ async def portfolio(req: Request):
         allocation[s.get("asset")] = {
             "amount": round(capital * weight, 2),
             "entry_zone": s.get("entry_zone"),
-            "risk_reward": s.get("risk_reward")
+            "risk_reward": s.get("risk_reward"),
+            "direction": s.get("direction")
         }
 
     return JSONResponse({
@@ -1172,11 +1201,13 @@ async def demo():
         "version": "10.0",
         "status": "active",
         "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
+        "tp_strategy": "Realistic 3-6% take profits with 2:1 to 2.5:1 R:R",
         "market_regime": cache["market_regime"],
         "fear_greed": cache["fear_greed"],
         "best_signal": {
             "asset": best.get("asset") if best else None,
             "signal": best.get("signal") if best else None,
+            "direction": best.get("direction") if best else None,
             "confidence": best.get("confidence") if best else None,
             "entry_zone": best.get("entry_zone") if best else None
         } if best else None,
@@ -1184,6 +1215,7 @@ async def demo():
             "asset": s.get("asset"),
             "confidence": s.get("confidence"),
             "signal": s.get("signal"),
+            "direction": s.get("direction"),
             "entry_zone": s.get("entry_zone")
         } for s in signals[:3]] if signals else [],
         "accuracy": f"{accuracy}%",
@@ -1207,7 +1239,8 @@ def business_model():
                 "Full history",
                 "Telegram alerts",
                 "Entry zone recommendations",
-                "Position sizing guidance"
+                "Position sizing guidance",
+                "Realistic TP/SL with 2:1+ R:R"
             ]
         },
         "enterprise": {
@@ -1234,6 +1267,7 @@ async def explain(symbol: str):
     return JSONResponse({
         "asset": signal.get("asset"),
         "signal": signal.get("signal"),
+        "direction": signal.get("direction"),
         "confidence": signal.get("confidence"),
         "grade": signal.get("grade"),
         "bullish_reasons": signal.get("bullish_reasons"),
@@ -1254,7 +1288,6 @@ async def explain(symbol: str):
         "risk": signal.get("risk"),
         "holding_period": signal.get("holding_period"),
         "pullback_pct": signal.get("pullback_pct"),
-        "direction": signal.get("direction"),
         "timestamp": signal.get("timestamp")
     })
 
@@ -1285,6 +1318,7 @@ def cap_metadata():
         "callable": True,
         "supports": [a.replace("USDT", "") for a in ASSETS],
         "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
+        "tp_strategy": "Realistic 3-6% take profits with 2:1 to 2.5:1 R:R",
         "features": [
             "pullback_detection",
             "confidence_scoring",
@@ -1296,7 +1330,8 @@ def cap_metadata():
             "multi_source_data",
             "A2A_compatible",
             "entry_zone_recommendations",
-            "position_sizing"
+            "position_sizing",
+            "realistic_tp_sl"
         ],
         "pricing": {
             "free": "5 requests/day",
@@ -1316,11 +1351,12 @@ def cap_health():
         "auto_scanner": "active_5min",
         "websocket_feed": "active",
         "entry_strategy": "Zone-based entries (0.5-1% below/above current price)",
+        "tp_strategy": "Realistic 3-6% take profits with 2:1 to 2.5:1 R:R",
         "last_scan": f"{int(time.time() - cache['last_successful_scan'])}s ago" if cache["last_successful_scan"] else "never",
         "last_price_update": f"{int(time.time() - cache['last_ws_update'])}s ago" if cache["last_ws_update"] else "never",
         "signals_generated": performance["total"],
         "active_users": len(users_db),
-        "features": ["pullback", "regime", "fear_greed", "A2A", "explainability", "portfolio", "entry_zones"],
+        "features": ["pullback", "regime", "fear_greed", "A2A", "explainability", "portfolio", "entry_zones", "realistic_tps"],
         "version": "10.0-croo-final"
     })
 
@@ -1349,7 +1385,8 @@ def capabilities():
             "portfolio_management",
             "risk_management",
             "entry_zone_recommendations",
-            "position_sizing_guidance"
+            "position_sizing_guidance",
+            "realistic_take_profits"
         ],
         "assets": [a.replace("USDT", "") for a in ASSETS],
         "sources": ["Binance", "Bybit", "OKX", "Kraken", "CoinGecko"],
@@ -1358,7 +1395,8 @@ def capabilities():
             "long_entries": "0.2% - 3.5% below current price",
             "short_entries": "0.2% - 3.5% above current price",
             "position_sizing": "50% moderate, 30% conservative, 20% DCA",
-            "risk_reward": "Minimum 2:1"
+            "risk_reward": "2:1 to 2.5:1",
+            "tp_range": "3% - 6%"
         },
         "api_endpoints": [
             "/oracle", "/best_signal", "/leaderboard", "/stats",
@@ -1374,12 +1412,13 @@ def capabilities():
 def agent_manifest():
     return {
         "name": "CROO AI Oracle",
-        "description": "Autonomous crypto intelligence agent with pullback detection, market regime analysis, entry zone recommendations, and explainable AI",
+        "description": "Autonomous crypto intelligence agent with pullback detection, market regime analysis, entry zone recommendations, realistic TP/SL, and explainable AI",
         "endpoint": "/agent/query",
         "a2a_endpoint": "/a2a",
         "entry_strategy": {
             "type": "Zone-based entries",
-            "description": "Never enters at current price. Uses 0.5-1% below/above current price with multiple levels"
+            "description": "Never enters at current price. Uses 0.5-1% below/above current price with multiple levels",
+            "tp_range": "3-6% with 2:1 to 2.5:1 R:R"
         },
         "capabilities": [
             "pullback_detection",
@@ -1390,7 +1429,8 @@ def agent_manifest():
             "multi_source_data",
             "auto_alerts",
             "portfolio_management",
-            "entry_zone_recommendations"
+            "entry_zone_recommendations",
+            "realistic_risk_management"
         ],
         "assets": [a.replace("USDT", "") for a in ASSETS],
         "version": "10.0"
@@ -1465,9 +1505,11 @@ async def handle_message(chat_id, text, user_id):
         msg += f"Market: {regime} | F&G: {cache['fear_greed']}\n"
         msg += f"Assets: {len(ASSETS)} monitored\n"
         msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)\n"
+        msg += f"TP Strategy: Realistic 3-6% with 2:1+ R:R\n"
         if top and top.get("confidence", 0) > 0:
             msg += f"\n🔥 Top: {top.get('asset')} {top.get('signal')} {top.get('confidence')}% ({top.get('grade')})\n"
             msg += f"Price: ${top.get('price')} | Zone: {top.get('entry_zone')}\n"
+            msg += f"TP: ${top.get('take_profit')} | R:R: {top.get('risk_reward')}\n"
         msg += "\n/scan /best /leaderboard /stats /why BTC"
         await bot.send_message(chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -1514,9 +1556,12 @@ async def send_why(chat_id, symbol):
 
     msg = f"🧠 WHY {symbol}?\n\n"
     msg += f"Decision: {signal.get('signal')}\n"
+    msg += f"Direction: {signal.get('direction')}\n"
     msg += f"Confidence: {signal.get('confidence')}%\n"
     msg += f"Risk: {signal.get('risk')}\n"
     msg += f"Entry Zone: {signal.get('entry_zone')}\n"
+    msg += f"TP: ${signal.get('take_profit')}\n"
+    msg += f"SL: ${signal.get('stop_loss')}\n"
     msg += f"R:R: {signal.get('risk_reward')}\n\n"
 
     if signal.get('direction') == 'LONG':
@@ -1529,6 +1574,7 @@ async def send_why(chat_id, symbol):
 
     msg += f"\n\nMarket: {signal.get('market_regime', '').upper()} | F&G: {signal.get('fear_greed')}"
     msg += f"\nPosition Sizing: {signal.get('position_sizing', 'N/A')}"
+    msg += f"\nHolding Period: {signal.get('holding_period', 'N/A')}"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def send_leaderboard(chat_id):
@@ -1538,6 +1584,7 @@ async def send_leaderboard(chat_id):
     for i, s in enumerate(signals[:10], 1):
         msg += f"{i}. {s.get('asset','N/A')} - {s.get('confidence',0)}% ({s.get('grade','N/A')}) {s.get('signal','NONE')}\n"
         msg += f" ${s.get('price',0)} | Zone: {s.get('entry_zone','N/A')}\n"
+        msg += f" TP: ${s.get('take_profit',0)} | R:R: {s.get('risk_reward','N/A')}\n"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def send_stats(chat_id):
@@ -1552,7 +1599,8 @@ async def send_stats(chat_id):
     msg += f"Market Regime: {cache['market_regime'].upper()}\n"
     msg += f"Fear & Greed: {cache['fear_greed']}\n"
     msg += f"Revenue Simulated: ${round(agent_memory['revenue_simulated'], 2)}\n"
-    msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)"
+    msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)\n"
+    msg += f"TP Strategy: Realistic 3-6% with 2:1+ R:R"
     await bot.send_message(chat_id=chat_id, text=msg)
 
 async def handle_callback(chat_id, data, user_id):
@@ -1612,6 +1660,7 @@ async def startup_event():
     await scan_all()
     print("🚀 CROO AI Oracle started successfully")
     print("📊 Entry Strategy: Zone-based (0.5-1% below/above current price)")
+    print("🎯 TP Strategy: Realistic 3-6% with 2:1 to 2.5:1 R:R")
 
 @app.on_event("shutdown")
 async def shutdown_event():
