@@ -66,8 +66,7 @@ def fetch_coingecko_ohlcv(asset, days=4):
                 ts = prices[i][0]
                 close = prices[i][1]
                 vol = volumes[i][1] if i < len(volumes) else 0
-                # Standardized: [ts, open, high, low, close, volume]
-                klines.append([ts, close, close, close, close, vol])
+                klines.append([ts, close, close, close, vol])
             return klines[-100:], "CoinGecko"
     except Exception as e:
         print(f"CoinGecko ERR {asset}: {e}")
@@ -84,7 +83,6 @@ def fetch_kraken_ohlc(asset):
             if "error" in data and data["error"]: return None, None
             result_key = list(data["result"].keys())[0]
             raw = data["result"][result_key][-100:]
-            # Kraken: [time, open, high, low, close, vwap, volume, count]
             klines = []
             for r in raw:
                 klines.append([int(r[0])*1000, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6])])
@@ -105,7 +103,6 @@ def fetch_coinbase_candles(asset):
         if r.status_code == 200:
             raw = r.json()
             raw.reverse()
-            # Coinbase: [time, low, high, open, close, volume] -> standardize
             klines = []
             for r in raw[-100:]:
                 klines.append([r[0]*1000, r[3], r[2], r[1], r[4], r[5]])
@@ -656,4 +653,14 @@ def stats():
     return {
         "accuracy": f"{accuracy}%", "total_signals": performance["total"], "wins": performance["wins"],
         "losses": performance["losses"], "market_regime": cache["market_regime"], "fear_greed": cache["fear_greed"],
-        "best_asset": agent_memory["best
+        "best_asset": agent_memory["best_asset"], "best_asset_win_rate": f"{agent_memory['best_asset_win_rate']}%"
+    }
+
+@app.get("/reputation")
+def reputation():
+    score = min(100, performance["wins"] * 2)
+    return {"reputation_score": score, "grade": grade(score)}
+
+@app.get("/agent/memory")
+def get_memory():
+    return agent_memory
