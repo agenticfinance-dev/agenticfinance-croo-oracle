@@ -66,7 +66,7 @@ def fetch_coingecko_ohlcv(asset, days=4):
                 ts = prices[i][0]
                 close = prices[i][1]
                 vol = volumes[i][1] if i < len(volumes) else 0
-                klines.append([ts, close, close, vol])
+                klines.append([ts, close, vol])
             return klines[-100:], "CoinGecko"
     except Exception as e:
         print(f"CoinGecko ERR {asset}: {e}")
@@ -557,7 +557,7 @@ async def handle_callback(chat_id, data, user_id):
 # ==================== API ENDPOINTS ====================
 @app.get("/")
 def root():
-    return {"status": "CROO AI Oracle Online", "version": "10.1"}
+    return {"status": "CROO AI Oracle Online"}
 
 @app.get("/health")
 def health():
@@ -612,7 +612,6 @@ def agent_manifest():
     return {
         "name": "CROO AI Oracle",
         "description": "Autonomous crypto intelligence agent",
-        "version": "10.1",
         "endpoint": "/agent/query",
         "capabilities": ["pullback_detection", "market_intelligence", "signal_ranking", "regime_detection", "explainability"]
     }
@@ -634,7 +633,6 @@ def explain(symbol: str):
 @app.get("/agent/revenue")
 def revenue():
     return {
-        "model": "pay_per_signal", "price_per_call": "0.01 CRO", "monthly_projection": "500 CRO",
         "total_calls": agent_memory["total_calls"], "revenue_simulated": round(agent_memory["revenue_simulated"], 2)
     }
 
@@ -644,4 +642,15 @@ def stats():
     accuracy = round(performance["wins"] / performance["total"] * 100, 1) if performance["total"] > 0 else 0
     return {
         "accuracy": f"{accuracy}%", "total_signals": performance["total"], "wins": performance["wins"],
-        "losses": performance["losses"], "market_regime": cache["market_reg
+        "losses": performance["losses"], "market_regime": cache["market_regime"], "fear_greed": cache["fear_greed"],
+        "best_asset": agent_memory["best_asset"], "best_asset_win_rate": f"{agent_memory['best_asset_win_rate']}%"
+    }
+
+@app.get("/reputation")
+def reputation():
+    score = min(100, performance["wins"] * 2)
+    return {"reputation_score": score, "grade": grade(score)}
+
+@app.get("/agent/memory")
+def get_memory():
+    return agent_memory
