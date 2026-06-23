@@ -483,7 +483,7 @@ async def handle_message(chat_id, text, user_id):
         regime = cache["market_regime"].upper()
         top = max(signals, key=lambda x: x.get("confidence", 0)) if signals else None
 
-        msg = "🔮 CROO AI Oracle\n\n"
+        msg = "🔮 CROO AI Oracle\n"
         msg += f"Market: {regime} | F&G: {cache['fear_greed']}\n"
         msg += f"Assets: {len(ASSETS)} monitored\n"
         if top and top.get("confidence", 0) > 0:
@@ -667,3 +667,11 @@ async def stats():
         "accuracy": f"{accuracy}%", "total_signals": performance["total"], "wins": performance["wins"],
         "losses": performance["losses"], "market_regime": cache["market_regime"], "fear_greed": cache["fear_greed"],
         "best_asset": agent_memory["best_asset"], "best_asset_win_rate": f"{agent_memory['best_asset_win_rate']}%"
+    }
+
+@app.get("/reputation")
+def reputation():
+    score = min(100, performance["wins"] * 2)
+    return {"reputation_score": score, "grade": grade(score)}
+
+@app.get("/agent/memory
