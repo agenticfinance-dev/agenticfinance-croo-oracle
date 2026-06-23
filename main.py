@@ -66,7 +66,7 @@ def fetch_coingecko_ohlcv(asset, days=4):
                 ts = prices[i][0]
                 close = prices[i][1]
                 vol = volumes[i][1] if i < len(volumes) else 0
-                klines.append([ts, close, close, close, close, vol])
+                klines.append([ts, close, close, close, vol])
             return klines[-100:], "CoinGecko"
     except Exception as e:
         print(f"CoinGecko ERR {asset}: {e}")
@@ -196,7 +196,7 @@ def analyze_asset(symbol):
         if price > 0:
             return {
                 "asset": symbol.replace("USDT", ""), "signal": "WATCH", "confidence": 20,
-                "grade": "F", "price": round(price, 4), "entry": round(price, 4),
+                "grade": "D", "price": round(price, 4), "entry": round(price, 4),
                 "stop_loss": round(price * 0.97, 4), "take_profit": round(price * 1.05, 4),
                 "bullish_reasons": ["Price only"], "bearish_reasons": [],
                 "missing_conditions": ["Full OHLCV data unavailable"], "source": "price_only", "direction": "NONE"
@@ -295,7 +295,7 @@ def analyze_asset(symbol):
     if confidence >= 70: signal = "BUY" if direction == "LONG" else "SHORT"
     elif confidence >= 50: signal = "WATCH"
 
-    # WATCH shows actionable levels
+    # WATCH now shows actionable levels
     if signal == "BUY":
         stop_loss = round(price * 0.95, 4)
         take_profit = round(price * 1.10, 4)
@@ -376,7 +376,7 @@ async def send_alert(signal):
     msg = f"🚨 NEW {signal['signal']} SIGNAL\n\n"
     msg += f"Asset: {signal['asset']}\nConfidence: {signal['confidence']}% ({signal['grade']})\n\n"
     msg += f"Entry:\n{signal['entry']}\n\nTarget:\n{signal['take_profit']}\n\n"
-    msg += f"Stop:\n{signal['stop_loss']}\n\nReasons:\n" + "\n".join([f"✅ {r}" for r in signal['bullish_reasons'] if signal['direction']=='LONG' else [f"✅ {r}" for r in signal['bearish_reasons']]])
+    msg += f"Stop:\n{signal['stop_loss']}\n\nReasons:\n" + "\n".join([f"✅ {r}" for r in (signal['bullish_reasons'] if signal['direction']=='LONG' else signal['bearish_reasons'])])
     msg += f"\n\nMarket: {signal['market_regime'].upper()} | F&G: {signal['fear_greed']} | Source: {signal['source']}"
     if CHAT_ID:
         try: await bot.send_message(chat_id=CHAT_ID, text=msg)
@@ -659,20 +659,4 @@ def stats():
 
 @app.get("/reputation")
 def reputation():
-    score = min(100, performance["wins"] * 2)
-    return {"reputation_score": score, "grade": grade(score)}
-
-@app.get("/agent/memory")
-def get_memory():
-    return agent_memory
-
-@app.get("/demo")
-def demo():
-    scan_all()
-    signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
-    if not signals: return {"error": "No signals"}
-    best = max(signals, key=lambda x: x.get("confidence", 0))
-    return {
-        "best_signal": best.get("asset"), "confidence": best.get("confidence"), "grade": best.get("grade"),
-        "entry": best.get("entry"), "tp": best.get("take_profit"), "sl": best.get("stop_loss"),
-        "market_regime": best.get("market
+    score = min(
