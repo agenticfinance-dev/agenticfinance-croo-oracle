@@ -7,15 +7,89 @@ import json
 import random
 import websockets
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
+# ==================== GLOBAL TASK VARS ====================
+scanner_task = None
+ws_task = None
+health_task = None
+telegram_worker_task = None
+
+# ==================== LIFESPAN ====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global session, scanner_task, ws_task, health_task, telegram_worker_task
+    # Startup
+    load_memory()
+
+    timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15)
+    connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300, enable_cleanup_closed=True)
+    session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+    if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN and bot:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        await bot.set_webhook(url=webhook_url)
+        print(f"Webhook set: {webhook_url}")
+
+    telegram_worker_task = asyncio.create_task(telegram_worker())
+    print("Telegram worker started")
+
+    scanner_task = asyncio.create_task(scanner_loop())
+    print("Scanner started")
+
+    ws_task = asyncio.create_task(start_websockets())
+    print("WebSockets started")
+
+    health_task = asyncio.create_task(health_monitor())
+    print("Health monitor started")
+
+    await scan_all(force=True)
+    print_startup_banner()
+
+    yield  # Server runs
+
+    # Shutdown
+    print("Shutting down...")
+    shutdown_event.set()
+
+    save_memory()
+    print("Memory saved")
+
+    tasks_to_cancel = []
+    if scanner_task:
+        tasks_to_cancel.append(scanner_task)
+    if ws_task:
+        tasks_to_cancel.append(ws_task)
+    if health_task:
+        tasks_to_cancel.append(health_task)
+    if telegram_worker_task:
+        tasks_to_cancel.append(telegram_worker_task)
+    for t in ws_tasks:
+        tasks_to_cancel.append(t)
+
+    for task in tasks_to_cancel:
+        if task:
+            task.cancel()
+
+    if tasks_to_cancel:
+        await asyncio.gather(*[t for t in tasks_to_cancel if t], return_exceptions=True)
+        print("All tasks cancelled")
+
+    if session:
+        await session.close()
+        print("Session closed")
+
+    print("Shutdown complete")
+
 app = FastAPI(
     title="CROO AI Oracle",
     description="Autonomous Crypto Intelligence Agent with Multi-Provider Fallback, A2A, and Explainable AI",
-    version="10.0"
+    version="10.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -33,6 +107,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0")) if os.environ.get("ADMIN_ID") el
 CHAT_ID = os.environ.get("CHAT_ID")
 PAYMENTS_ENABLED = False
 PORT = int(os.getenv("PORT", 8000))
+SECRET_TOKEN = os.environ.get("TELEGRAM_SECRET_TOKEN", "default_secret")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 start_time = time.time()
@@ -78,10 +153,7 @@ agent_memory = {
     "revenue_simulated": 0.0
 }
 
-scanner_task = None
 ws_tasks = []
-health_task = None
-telegram_worker_task = None
 disabled_ws = set()
 provider_status = {}
 
@@ -95,12 +167,15 @@ api_failures = {}
 cg_cache = {}
 session = None
 
-# ==================== MEMORY ====================
+# ==================== MEMORY (atomic) ====================
+MEMORY_FILE = "agent_memory.json"
+MEMORY_TMP = "agent_memory.tmp"
+
 def load_memory():
     global signal_history, performance, agent_memory, cache
     try:
-        if os.path.exists("agent_memory.json"):
-            with open("agent_memory.json", "r") as f:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r") as f:
                 data = json.load(f)
                 signal_history = data.get("signal_history", [])
                 performance = data.get("performance", {"wins": 0, "losses": 0, "total": 0})
@@ -118,14 +193,16 @@ def load_memory():
 
 def save_memory():
     try:
-        with open("agent_memory.json", "w") as f:
-            json.dump({
-                "signal_history": signal_history[-100:],
-                "performance": performance,
-                "agent_memory": agent_memory,
-                "last_prices": cache["last_known_prices"],
-                "timestamp": datetime.utcnow().isoformat()
-            }, f)
+        data = {
+            "signal_history": signal_history[-100:],
+            "performance": performance,
+            "agent_memory": agent_memory,
+            "last_prices": cache["last_known_prices"],
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        with open(MEMORY_TMP, "w") as f:
+            json.dump(data, f)
+        os.replace(MEMORY_TMP, MEMORY_FILE)
     except Exception as e:
         print(f"Memory save failed: {e}")
 
@@ -579,6 +656,30 @@ def activate_pro(user_id: int, days: int = 30):
         users_db[user_id] = {}
     users_db[user_id]["plan"] = "pro"
     users_db[user_id]["pro_expires"] = datetime.now() + timedelta(days=days)
+
+# ==================== PER‑USER USAGE ====================
+def get_user(user_id):
+    if user_id not in users_db:
+        users_db[user_id] = {
+            "plan": "free",
+            "pro_expires": None,
+            "calls_today": 0,
+            "last_reset": datetime.now().date()
+        }
+    user = users_db[user_id]
+    if datetime.now().date() > user["last_reset"]:
+        user["calls_today"] = 0
+        user["last_reset"] = datetime.now().date()
+    return user
+
+def can_user_call(user_id):
+    user = get_user(user_id)
+    if user["plan"] in ["pro", "lifetime"]:
+        return True
+    if user["calls_today"] < 5:
+        user["calls_today"] += 1
+        return True
+    return False
 
 # ==================== CAPITAL PLAN ====================
 def get_capital_plan():
@@ -1045,9 +1146,17 @@ async def health_monitor():
     while not shutdown_event.is_set():
         try:
             if time.time() - cache["last_ws_update"] > 120:
-                print(f"WARNING: WebSocket stale ({int(time.time() - cache['last_ws_update'])}s)")
+                print("WARNING: WebSocket stale – restarting feeds...")
+                for task in ws_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*[t for t in ws_tasks if not t.done()], return_exceptions=True)
+                asyncio.create_task(start_websockets())
             if time.time() - cache["last_successful_scan"] > 900:
-                print(f"WARNING: Scanner stalled ({int(time.time() - cache['last_successful_scan'])}s)")
+                print("WARNING: Scanner stalled – restarting...")
+                if scanner_task and not scanner_task.done():
+                    scanner_task.cancel()
+                asyncio.create_task(scanner_loop())
             if telegram_queue.qsize() > 50:
                 print(f"WARNING: Telegram queue size {telegram_queue.qsize()}")
             await asyncio.sleep(60)
@@ -1122,6 +1231,34 @@ async def a2a(request: Request):
             "to_agent": agent
         })
 
+    elif request_type == "allocate_capital":
+        capital = data.get("capital", 1000)
+        if time.time() - cache["last_scan"] > 300:
+            await scan_all()
+        allocation = generate_portfolio(capital)
+        if "error" in allocation:
+            return JSONResponse({
+                "job_id": job_id,
+                "status": "error",
+                "message": allocation["error"],
+                "from_agent": "CROO Oracle",
+                "to_agent": agent
+            }, status_code=400)
+        agent_memory["total_calls"] += 1
+        agent_memory["revenue_simulated"] += 0.02
+        save_memory()
+        return JSONResponse({
+            "job_id": job_id,
+            "status": "completed",
+            "cost": "0.02 USDC",
+            "result": {
+                "capital": capital,
+                "allocation": allocation
+            },
+            "from_agent": "CROO Oracle",
+            "to_agent": agent
+        })
+
     return JSONResponse({
         "job_id": job_id,
         "status": "error",
@@ -1145,8 +1282,7 @@ async def send_leaderboard(chat_id, include_back=True):
     signals = sorted(cache["signals"].values(), key=lambda x: x.get("confidence", 0), reverse=True)
     regime = cache["market_regime"].upper()
     fg = cache["fear_greed"]
-    msg = f"🏆 LEADERBOARD | {regime} | F&G: {fg}\n"
-    msg += "=" * 30 + "\n\n"
+    msg = f"🏆 LEADERBOARD | {regime} | F&G: {fg}\n\n"
 
     for i, s in enumerate(signals[:10], 1):
         asset = s.get('asset', 'N/A')
@@ -1243,8 +1379,14 @@ async def handle_sell(chat_id, user_id):
             "✅ DEMO: Pro subscription cancelled\n\nBack to Free plan.\nRe-upgrade: /buy"
         )
 
+# ==================== TELEGRAM MESSAGE HANDLER ====================
 async def handle_message(chat_id, text, user_id):
     if not bot:
+        return
+
+    # Rate-limit free users (except for /start, /buy, /sell)
+    if text not in ["/start", "/buy", "/sell"] and not can_user_call(user_id):
+        await send_telegram_message(chat_id, "Free limit reached (5 calls/day). Upgrade to Pro with /buy.")
         return
 
     if text == "/start":
@@ -1334,16 +1476,12 @@ async def handle_message(chat_id, text, user_id):
         await send_telegram_message(chat_id, msg)
 
     elif text == "/usage":
-        used = agent_memory["total_calls"]
-        free_limit = 5
-        if used >= free_limit and not is_pro(user_id):
-            remaining = 0
-            status = "⚠️ Free limit reached. Upgrade to Pro!"
-        else:
-            remaining = max(0, free_limit - used)
-            status = f"✅ {remaining} free requests left today"
+        user = get_user(user_id)
+        used = user["calls_today"]
+        limit = 5 if user["plan"] == "free" else "unlimited"
+        status = "Pro ✅" if user["plan"] in ["pro", "lifetime"] else f"Free – {used}/5 used today"
         msg = f"📊 Your Usage\n\n"
-        msg += f"Calls made: {used}\n"
+        msg += f"Plan: {user['plan'].upper()}\n"
         msg += f"Status: {status}\n"
         await send_telegram_message(chat_id, msg)
 
@@ -1455,6 +1593,21 @@ async def handle_callback(chat_id, data, user_id):
             await send_telegram_message(chat_id, f"No data for {data.replace('USDT','')} yet. Scanning...")
         else:
             await send_rich_card(chat_id, s, back_button=True)
+
+# ==================== PORTFOLIO ALLOCATION ====================
+def generate_portfolio(capital=1000):
+    signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
+    if not signals:
+        return {"error": "No signals available for allocation"}
+    top = sorted(signals, key=lambda x: x.get("confidence", 0), reverse=True)[:5]
+    total_conf = sum(s.get("confidence", 0) for s in top)
+    if total_conf == 0:
+        return {"error": "Insufficient confidence"}
+    allocation = {}
+    for s in top:
+        weight = s.get("confidence", 0) / total_conf
+        allocation[s.get("asset")] = round(capital * weight, 2)
+    return allocation
 
 # ==================== API ENDPOINTS ====================
 
@@ -1812,7 +1965,7 @@ async def demo():
         await scan_all()
     signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
     best = max(signals, key=lambda x: x.get("confidence", 0)) if signals else None
-    accuracy = round(performance["wins"] / performance["total"] * 100, 1) if performance["total"] > 0 else 0
+    accuracy = round(performance["wins"] / max(1, performance["total"]) * 100, 1) if performance["total"] > 0 else 0
 
     return JSONResponse({
         "agent": "CROO AI Oracle",
@@ -2059,6 +2212,11 @@ def agent_manifest():
 # ==================== TELEGRAM WEBHOOK ====================
 @app.post("/webhook")
 async def webhook(request: Request):
+    # Optional: verify secret token
+    if SECRET_TOKEN != "default_secret":
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if token != SECRET_TOKEN:
+            raise HTTPException(status_code=403, detail="Unauthorized")
     data = await request.json()
     if "message" in data:
         chat_id = data["message"]["chat"]["id"]
@@ -2100,81 +2258,6 @@ def print_startup_banner():
     for cap in caps:
         print(f"  {cap}")
     print("\n" + "=" * 50)
-
-# ==================== STARTUP / SHUTDOWN ====================
-@app.on_event("startup")
-async def startup_event():
-    global session, scanner_task, ws_task, health_task, telegram_worker_task
-
-    load_memory()
-
-    timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15)
-    connector = aiohttp.TCPConnector(
-        limit=100,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True
-    )
-    session = aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector
-    )
-
-    if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN and bot:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        await bot.set_webhook(url=webhook_url)
-        print(f"Webhook set: {webhook_url}")
-
-    telegram_worker_task = asyncio.create_task(telegram_worker())
-    print("Telegram worker started")
-
-    scanner_task = asyncio.create_task(scanner_loop())
-    print("Scanner started")
-
-    ws_task = asyncio.create_task(start_websockets())
-    print("WebSockets started")
-
-    health_task = asyncio.create_task(health_monitor())
-    print("Health monitor started")
-
-    await scan_all(force=True)
-
-    print_startup_banner()
-
-@app.on_event("shutdown")
-async def shutdown():
-    global session, scanner_task, ws_task, health_task, telegram_worker_task, ws_tasks
-
-    print("Shutting down...")
-    shutdown_event.set()
-
-    save_memory()
-    print("Memory saved")
-
-    tasks_to_cancel = []
-    if scanner_task:
-        tasks_to_cancel.append(scanner_task)
-    if ws_task:
-        tasks_to_cancel.append(ws_task)
-    if health_task:
-        tasks_to_cancel.append(health_task)
-    if telegram_worker_task:
-        tasks_to_cancel.append(telegram_worker_task)
-    for t in ws_tasks:
-        tasks_to_cancel.append(t)
-
-    for task in tasks_to_cancel:
-        if task:
-            task.cancel()
-
-    if tasks_to_cancel:
-        await asyncio.gather(*[t for t in tasks_to_cancel if t], return_exceptions=True)
-        print("All tasks cancelled")
-
-    if session:
-        await session.close()
-        print("Session closed")
-
-    print("Shutdown complete")
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
