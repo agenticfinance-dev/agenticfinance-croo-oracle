@@ -174,7 +174,7 @@ def mark_success(name):
         api_failures[name] = (0, time.time() + 600)
     provider_status[name] = "active"
 
-# ==================== TELEGRAM QUEUE (NO HTML) ====================
+# ==================== TELEGRAM QUEUE ====================
 async def telegram_worker():
     while not shutdown_event.is_set():
         try:
@@ -354,25 +354,6 @@ async def fetch_coingecko_ohlcv(asset):
     mark_failure("coingecko")
     return None, None
 
-async def fetch_coinmarketcap_price(asset):
-    if not can_call(f"cmc_{asset}", 60) or not check_circuit_breaker("coinmarketcap"):
-        return None
-    try:
-        cmc_api_key = os.environ.get("CMC_API_KEY", "")
-        if not cmc_api_key:
-            return None
-        symbol = asset.replace("USDT", "")
-        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-        async with session.get(url, params={"symbol": symbol, "convert": "USD"}, headers={"X-CMC_PRO_API_KEY": cmc_api_key}) as r:
-            if r.status == 200:
-                data = await r.json()
-                price = data["data"][symbol]["quote"]["USD"]["price"]
-                mark_success("coinmarketcap")
-                return price
-    except: pass
-    mark_failure("coinmarketcap")
-    return None
-
 async def get_ohlcv(asset):
     providers = [fetch_okx_ohlc, fetch_bybit_ohlc, fetch_binance_ohlc, fetch_coingecko_ohlcv]
     for provider in providers:
@@ -385,6 +366,7 @@ async def get_ohlcv(asset):
             print(f"{provider.__name__} error: {e}")
     return None, "none"
 
+# ==================== PRICE FALLBACKS ====================
 async def fetch_binance_price(asset):
     if not can_call(f"binance_price_{asset}", 10):
         return None
@@ -417,6 +399,25 @@ async def fetch_coingecko_price(asset):
                 data = await r.json()
                 return float(data[coin_id]["usd"])
     except: pass
+    return None
+
+async def fetch_coinmarketcap_price(asset):
+    if not can_call(f"cmc_{asset}", 60) or not check_circuit_breaker("coinmarketcap"):
+        return None
+    try:
+        cmc_api_key = os.environ.get("CMC_API_KEY", "")
+        if not cmc_api_key:
+            return None
+        symbol = asset.replace("USDT", "")
+        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+        async with session.get(url, params={"symbol": symbol, "convert": "USD"}, headers={"X-CMC_PRO_API_KEY": cmc_api_key}) as r:
+            if r.status == 200:
+                data = await r.json()
+                price = data["data"][symbol]["quote"]["USD"]["price"]
+                mark_success("coinmarketcap")
+                return price
+    except: pass
+    mark_failure("coinmarketcap")
     return None
 
 async def get_price_fallback(asset):
@@ -690,7 +691,6 @@ async def analyze_asset(symbol):
     checks = {}
     reasoning = []
 
-    # RSI
     if rsi_val < 45:
         long_score += 20
         bullish_reasons.append(f"RSI Oversold ({rsi_val:.1f})")
@@ -706,7 +706,6 @@ async def analyze_asset(symbol):
         checks["rsi_extreme"] = False
         reasoning.append("RSI neutral – no extreme signal")
 
-    # EMA
     if price > ema50:
         long_score += 20
         bullish_reasons.append("Above EMA50")
@@ -722,7 +721,6 @@ async def analyze_asset(symbol):
         checks["ema_trend"] = False
         reasoning.append("No clear EMA trend")
 
-    # Pullback/Bounce
     if price > ema50 and 4 < pullback < 12 and price_near_ema20:
         long_score += 20
         bullish_reasons.append(f"Dip {pullback:.1f}% to EMA20")
@@ -738,7 +736,6 @@ async def analyze_asset(symbol):
         checks["pullback_zone"] = False
         reasoning.append("Pullback not in optimal zone")
 
-    # Volume
     if vol_spike:
         if long_score >= short_score:
             long_score += 20
@@ -755,7 +752,6 @@ async def analyze_asset(symbol):
         checks["volume_spike"] = False
         reasoning.append("No significant volume")
 
-    # Confirmation
     if bullish_confirmation:
         long_score += 20
         bullish_reasons.append("Bullish Confirmation")
@@ -771,7 +767,6 @@ async def analyze_asset(symbol):
         checks["confirmation"] = False
         reasoning.append("No clear confirmation candle")
 
-    # Fear & Greed
     fg = cache["fear_greed"]
     if fg < 25 and long_score >= short_score:
         long_score += 5
@@ -784,7 +779,6 @@ async def analyze_asset(symbol):
         checks["extreme_greed"] = True
         reasoning.append(f"Fear & Greed = {fg} (extreme greed)")
 
-    # Volatility penalty
     if atr_pct < 1:
         if long_score >= short_score:
             long_score -= 15
@@ -1071,11 +1065,9 @@ async def a2a(request: Request):
 
     agent = data.get("agent", "Unknown")
     request_type = data.get("request", "")
-
     job_id = f"job_{int(time.time())}_{random.randint(1000, 9999)}"
 
     if request_type == "best_trade":
-        # Ensure fresh data
         if time.time() - cache["last_scan"] > 300:
             await scan_all()
         signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
@@ -1088,7 +1080,6 @@ async def a2a(request: Request):
                 "to_agent": agent
             })
         best = max(signals, key=lambda x: x.get("confidence", 0))
-        # Track revenue
         agent_memory["total_calls"] += 1
         agent_memory["revenue_simulated"] += 0.01
         save_memory()
@@ -1139,7 +1130,48 @@ async def a2a(request: Request):
         "to_agent": agent
     }, status_code=400)
 
-# ==================== TELEGRAM COMMANDS ====================
+# ==================== TELEGRAM FORMATTING ====================
+def decision_emoji(decision):
+    if decision == "BUY":
+        return "🟢"
+    elif decision == "SELL":
+        return "🔴"
+    else:
+        return "🔵"
+
+async def send_leaderboard(chat_id, include_back=True):
+    if time.time() - cache["last_scan"] > 300:
+        await scan_all()
+    signals = sorted(cache["signals"].values(), key=lambda x: x.get("confidence", 0), reverse=True)
+    regime = cache["market_regime"].upper()
+    fg = cache["fear_greed"]
+    msg = f"🏆 LEADERBOARD | {regime} | F&G: {fg}\n"
+    msg += "=" * 30 + "\n\n"
+
+    for i, s in enumerate(signals[:10], 1):
+        asset = s.get('asset', 'N/A')
+        decision = s.get('decision', 'HOLD')
+        conf = s.get('confidence', 0)
+        grade_str = s.get('grade', 'F')
+        price = s.get('price', 0)
+        entry_zone = s.get('entry_zone', 'N/A')
+        tp = s.get('take_profit', 0)
+        rr = s.get('risk_reward', 'N/A')
+        action = s.get('action', 'N/A')
+
+        emoji = decision_emoji(decision)
+        msg += f"{i}. {emoji} {asset} - {conf}% ({grade_str}) {decision}\n"
+        msg += f"   Price: ${price} | Zone: {entry_zone}\n"
+        msg += f"   TP: ${tp} | R:R: {rr}\n"
+        msg += f"   Action: {action}\n"
+        msg += "---\n"
+
+    if include_back:
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]]
+        await send_telegram_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await send_telegram_message(chat_id, msg)
+
 async def send_rich_card(chat_id, s, back_button=True):
     decision = s.get("decision", "HOLD")
     if decision == "HOLD":
@@ -1253,7 +1285,7 @@ async def handle_message(chat_id, text, user_id):
 
     elif text in ["/scan", "/signals"]:
         await scan_all(force=True)
-        await send_leaderboard(chat_id)
+        await send_leaderboard(chat_id, include_back=True)
 
     elif text == "/best":
         if time.time() - cache["last_scan"] > 120:
@@ -1262,10 +1294,10 @@ async def handle_message(chat_id, text, user_id):
         if not signals:
             await send_telegram_message(chat_id, "No signals yet. Scanning...")
         else:
-            await send_rich_card(chat_id, max(signals, key=lambda x: x.get("confidence", 0)))
+            await send_rich_card(chat_id, max(signals, key=lambda x: x.get("confidence", 0)), back_button=True)
 
     elif text == "/leaderboard":
-        await send_leaderboard(chat_id)
+        await send_leaderboard(chat_id, include_back=True)
 
     elif text == "/stats":
         await send_stats(chat_id)
@@ -1295,9 +1327,9 @@ async def handle_message(chat_id, text, user_id):
 
     elif text == "/subscribe":
         msg = "💎 CROO Oracle Subscription\n\n"
-        msg += "**Free Plan**\n- 5 requests/day\n- Basic signals\n\n"
-        msg += "**Pro Plan** – $9.99/month\n- Unlimited requests\n- All assets\n- Entry zones & position sizing\n- Telegram alerts\n\n"
-        msg += "**Enterprise** – Custom pricing\n- Full API access\n- White-label\n- Dedicated support\n\n"
+        msg += "Free Plan\n- 5 requests/day\n- Basic signals\n\n"
+        msg += "Pro Plan – $9.99/month\n- Unlimited requests\n- All assets\n- Entry zones & position sizing\n- Telegram alerts\n\n"
+        msg += "Enterprise – Custom pricing\n- Full API access\n- White-label\n- Dedicated support\n\n"
         msg += "🔹 Hackathon Demo – All features unlocked for free!\n"
         await send_telegram_message(chat_id, msg)
 
@@ -1366,18 +1398,6 @@ async def send_why(chat_id, symbol):
     msg += f"\nHolding Period: {signal.get('holding_period', 'N/A')}"
     await send_telegram_message(chat_id, msg)
 
-async def send_leaderboard(chat_id):
-    if time.time() - cache["last_scan"] > 300:
-        await scan_all()
-    signals = sorted(cache["signals"].values(), key=lambda x: x.get("confidence", 0), reverse=True)
-    msg = f"🏆 LEADERBOARD | {cache['market_regime'].upper()} | F&G: {cache['fear_greed']}\n\n"
-    for i, s in enumerate(signals[:10], 1):
-        msg += f"{i}. {s.get('asset','N/A')} - {s.get('confidence',0)}% ({s.get('grade','N/A')}) {s.get('decision','NONE')}\n"
-        msg += f" ${s.get('price',0)} | Zone: {s.get('entry_zone','N/A')}\n"
-        msg += f" TP: ${s.get('take_profit',0)} | R:R: {s.get('risk_reward','N/A')}\n"
-        msg += f" Action: {s.get('action','N/A')}\n"
-    await send_telegram_message(chat_id, msg)
-
 async def send_stats(chat_id):
     await update_performance()
     win_rate = performance["wins"] / max(1, performance["total"]) * 100
@@ -1410,10 +1430,10 @@ async def handle_callback(chat_id, data, user_id):
 
     if data == "scan_all":
         await scan_all(force=True)
-        await send_leaderboard(chat_id)
+        await send_leaderboard(chat_id, include_back=True)
 
     elif data == "leaderboard":
-        await send_leaderboard(chat_id)
+        await send_leaderboard(chat_id, include_back=True)
 
     elif data == "best_signal":
         if time.time() - cache["last_scan"] > 120:
@@ -1422,7 +1442,7 @@ async def handle_callback(chat_id, data, user_id):
         if not signals:
             await send_telegram_message(chat_id, "No signals yet. Scanning...")
         else:
-            await send_rich_card(chat_id, max(signals, key=lambda x: x.get("confidence", 0)))
+            await send_rich_card(chat_id, max(signals, key=lambda x: x.get("confidence", 0)), back_button=True)
 
     elif data == "buy_cmd":
         await handle_buy(chat_id, user_id)
@@ -1434,7 +1454,7 @@ async def handle_callback(chat_id, data, user_id):
         if not s or s.get("confidence", 0) == 0:
             await send_telegram_message(chat_id, f"No data for {data.replace('USDT','')} yet. Scanning...")
         else:
-            await send_rich_card(chat_id, s)
+            await send_rich_card(chat_id, s, back_button=True)
 
 # ==================== API ENDPOINTS ====================
 
@@ -1509,7 +1529,7 @@ async def best_signal():
     })
 
 @app.get("/leaderboard")
-async def leaderboard():
+async def leaderboard_api():
     if time.time() - cache["last_scan"] > 300:
         await scan_all()
     signals = sorted(cache["signals"].values(), key=lambda x: x.get("confidence", 0), reverse=True)
@@ -1527,7 +1547,7 @@ async def leaderboard():
     } for s in signals[:10]])
 
 @app.get("/stats")
-async def stats():
+async def stats_api():
     if time.time() - cache["last_scan"] > 300:
         await scan_all()
     await update_performance()
