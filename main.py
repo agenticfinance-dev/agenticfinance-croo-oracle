@@ -7,7 +7,6 @@ import json
 import random
 import websockets
 from datetime import datetime, timedelta
-from collections import deque
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -138,12 +137,9 @@ cache = {
     "market_regime": "neutral",
     "fear_greed": 50,
     "live_prices": {},
-    "last_known_prices": {},
-    "scanning": False
+    "last_known_prices": {}
 }
-cache_lock = asyncio.Lock()
-
-signal_history = deque(maxlen=1000)
+signal_history = []
 users_db = {}
 last_alerted = {}
 performance = {"wins": 0, "losses": 0, "total": 0}
@@ -169,7 +165,7 @@ api_failures = {}
 cg_cache = {}
 session = None
 
-# ==================== MEMORY (ATOMIC) ====================
+# ==================== MEMORY (atomic) ====================
 MEMORY_FILE = "agent_memory.json"
 MEMORY_TMP = "agent_memory.tmp"
 
@@ -179,7 +175,7 @@ def load_memory():
         if os.path.exists(MEMORY_FILE):
             with open(MEMORY_FILE, "r") as f:
                 data = json.load(f)
-                signal_history = deque(data.get("signal_history", []), maxlen=1000)
+                signal_history = data.get("signal_history", [])
                 performance = data.get("performance", {"wins": 0, "losses": 0, "total": 0})
                 agent_memory = data.get("agent_memory", {
                     "last_100_signals": [],
@@ -196,7 +192,7 @@ def load_memory():
 def save_memory():
     try:
         data = {
-            "signal_history": list(signal_history),
+            "signal_history": signal_history[-100:],
             "performance": performance,
             "agent_memory": agent_memory,
             "last_prices": cache["last_known_prices"],
@@ -659,6 +655,7 @@ def activate_pro(user_id: int, days: int = 30):
     users_db[user_id]["plan"] = "pro"
     users_db[user_id]["pro_expires"] = datetime.now() + timedelta(days=days)
 
+# ==================== PER‑USER USAGE ====================
 def get_user(user_id):
     if user_id not in users_db:
         users_db[user_id] = {
@@ -966,12 +963,6 @@ async def analyze_asset(symbol):
     if not bearish_reasons:
         bearish_reasons = ["Waiting for setup"]
 
-    # Improved signal ranking score
-    score = confidence * 0.5 + float(rr_value) * 0.3 + (1 - atr_pct/100) * 0.2
-    # but rr_value is a string, so we need to extract numeric
-    rr_value = float(entry_data["risk_reward"].replace(":1", "")) if entry_data["risk_reward"] != "N/A" else 0
-    rank_score = confidence * 0.5 + rr_value * 0.3 + (1 - min(atr_pct/100, 0.2)) * 0.2
-
     return {
         "asset": symbol.replace("USDT", ""),
         "price": round(price, 4),
@@ -1000,7 +991,6 @@ async def analyze_asset(symbol):
         "why_not_now": why_not_now,
         "reasoning": reasoning,
         "capital_plan": get_capital_plan(),
-        "rank_score": round(rank_score, 2),
         "source": source,
         "market_regime": cache["market_regime"],
         "fear_greed": cache["fear_greed"],
@@ -1041,7 +1031,7 @@ async def update_performance():
     save_memory()
 
 def update_memory():
-    agent_memory["last_100_signals"] = list(signal_history)[-100:]
+    agent_memory["last_100_signals"] = signal_history[-100:]
     stats = {}
     for sig in signal_history:
         if sig.get("status") in ["win", "loss"]:
@@ -1093,56 +1083,49 @@ async def send_alert(signal):
 
 # ==================== SCANNER ====================
 async def scan_all(force=False):
-    if cache.get("scanning", False):
-        return cache["signals"]
-
     async with scan_lock:
         if not force and time.time() - cache["last_scan"] < 120:
             return cache["signals"]
 
-        cache["scanning"] = True
-        try:
-            print(f"SCAN {datetime.utcnow()}")
-            await fetch_fear_greed()
-            await update_performance()
-            cache["market_regime"] = await detect_regime()
+        print(f"SCAN {datetime.utcnow()}")
+        await fetch_fear_greed()
+        await update_performance()
+        cache["market_regime"] = await detect_regime()
 
-            results = {}
-            signal_summary = {"BUY":0, "SELL":0, "HOLD":0}
-            for asset in ASSETS:
-                data = await analyze_asset(asset)
-                if data:
-                    results[asset] = data
-                    signal_summary[data["decision"]] = signal_summary.get(data["decision"], 0) + 1
-                    signal_key = f"{data['asset']}_{data['decision']}_{data['direction']}_{round(data['price'], 2)}"
-                    if data["decision"] in ["BUY", "SELL"] and signal_key not in recent_signals:
-                        data["status"] = "open"
-                        signal_history.append(data)
-                        agent_memory["total_calls"] += 1
-                        agent_memory["revenue_simulated"] += 0.01
-                        recent_signals.add(signal_key)
-                        asyncio.create_task(send_alert(data))
-                        print(f"[SCAN] {data['asset']} {data['decision']} {data['confidence']}%")
+        results = {}
+        signal_summary = {"BUY":0, "SELL":0, "HOLD":0}
+        for asset in ASSETS:
+            data = await analyze_asset(asset)
+            if data:
+                results[asset] = data
+                signal_summary[data["decision"]] = signal_summary.get(data["decision"], 0) + 1
+                signal_key = f"{data['asset']}_{data['decision']}_{data['direction']}_{round(data['price'], 2)}"
+                if data["decision"] in ["BUY", "SELL"] and signal_key not in recent_signals:
+                    data["status"] = "open"
+                    signal_history.append(data)
+                    agent_memory["total_calls"] += 1
+                    agent_memory["revenue_simulated"] += 0.01
+                    recent_signals.add(signal_key)
+                    asyncio.create_task(send_alert(data))
+                    print(f"[SCAN] {data['asset']} {data['decision']} {data['confidence']}%")
 
-            print(f"[SUMMARY] BUY={signal_summary['BUY']} SELL={signal_summary['SELL']} HOLD={signal_summary['HOLD']}")
+        print(f"[SUMMARY] BUY={signal_summary['BUY']} SELL={signal_summary['SELL']} HOLD={signal_summary['HOLD']}")
 
-            if len(recent_signals) > 100:
-                recent_signals.clear()
+        signal_history[:] = signal_history[-100:]
+        if len(recent_signals) > 100:
+            recent_signals.clear()
 
-            async with cache_lock:
-                cache["signals"] = results
-                cache["last_scan"] = time.time()
-                cache["last_successful_scan"] = time.time()
-            save_memory()
+        cache["signals"] = results
+        cache["last_scan"] = time.time()
+        cache["last_successful_scan"] = time.time()
+        save_memory()
 
-            for asset in list(last_alerted.keys()):
-                if time.time() - last_alerted[asset] > 86400:
-                    del last_alerted[asset]
+        for asset in list(last_alerted.keys()):
+            if time.time() - last_alerted[asset] > 86400:
+                del last_alerted[asset]
 
-            print(f"Scan complete. {len(results)} assets analyzed.")
-            return results
-        finally:
-            cache["scanning"] = False
+        print(f"Scan complete. {len(results)} assets analyzed.")
+        return results
 
 async def scanner_loop():
     print("Auto scanner started")
@@ -1179,359 +1162,7 @@ async def health_monitor():
             print(f"Health monitor error: {e}")
             await asyncio.sleep(60)
 
-# ==================== TELEGRAM FORMATTING ====================
-def decision_emoji(decision):
-    if decision == "BUY":
-        return "🟢"
-    elif decision == "SELL":
-        return "🔴"
-    else:
-        return "🔵"
-
-async def send_leaderboard(chat_id, include_back=True):
-    if time.time() - cache["last_scan"] > 300:
-        await scan_all()
-    async with cache_lock:
-        signals = sorted(cache["signals"].values(), key=lambda x: x.get("confidence", 0), reverse=True)
-    regime = cache["market_regime"].upper()
-    fg = cache["fear_greed"]
-    msg = f"🏆 LEADERBOARD | {regime} | F&G: {fg}\n\n"
-
-    for i, s in enumerate(signals[:10], 1):
-        asset = s.get('asset', 'N/A')
-        decision = s.get('decision', 'HOLD')
-        conf = s.get('confidence', 0)
-        grade_str = s.get('grade', 'F')
-        price = s.get('price', 0)
-        entry_zone = s.get('entry_zone', 'N/A')
-        tp = s.get('take_profit', 0)
-        rr = s.get('risk_reward', 'N/A')
-        action = s.get('action', 'N/A')
-
-        emoji = decision_emoji(decision)
-        msg += f"{i}. {emoji} {asset} - {conf}% ({grade_str}) {decision}\n"
-        msg += f"   Price: ${price} | Zone: {entry_zone}\n"
-        msg += f"   TP: ${tp} | R:R: {rr}\n"
-        msg += f"   Action: {action}\n\n"   # <-- no separator line
-
-    if include_back:
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]]
-        await send_telegram_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await send_telegram_message(chat_id, msg)
-
-async def send_rich_card(chat_id, s, back_button=True):
-    decision = s.get("decision", "HOLD")
-    if decision == "HOLD":
-        if s.get("bias") == "LONG":
-            msg = "⏳ HOLD (LONG BIAS)\n\n"
-        elif s.get("bias") == "SHORT":
-            msg = "⏳ HOLD (SHORT BIAS)\n\n"
-        else:
-            msg = "⏳ HOLD\n\n"
-    else:
-        msg = f"🚨 {decision} SIGNAL\n\n"
-
-    msg += f"Asset: {s.get('asset')}\n"
-    msg += f"Confidence: {s.get('confidence')}% ({s.get('grade')})\n"
-    msg += f"Risk: {s.get('risk')}\n"
-    msg += f"Price: ${s.get('price')}\n\n"
-    msg += f"Entry Zone: {s.get('entry_zone')}\n"
-    msg += f"Entry: ${s.get('entry')}\n"
-    msg += f"Target: ${s.get('take_profit')}\n"
-    msg += f"Stop: ${s.get('stop_loss')}\n"
-    msg += f"R:R: {s.get('risk_reward')}\n\n"
-    msg += f"Position Sizing:\n{s.get('position_sizing')}\n\n"
-
-    if s.get('direction') == 'LONG':
-        msg += f"Bullish Reasons:\n" + "\n".join([f"✅ {r}" for r in s.get('bullish_reasons', ['None'])[:5]])
-    else:
-        msg += f"Bearish Reasons:\n" + "\n".join([f"✅ {r}" for r in s.get('bearish_reasons', ['None'])[:5]])
-
-    if s.get('missing_conditions'):
-        msg += "\n\nMissing Conditions:\n" + "\n".join([f"❌ {m}" for m in s.get('missing_conditions', [])[:3]])
-
-    if s.get('why_not_now'):
-        msg += "\n\nWhy Not Now:\n" + "\n".join([f"⏳ {w}" for w in s.get('why_not_now', [])[:3]])
-
-    if s.get('reasoning'):
-        msg += "\n\n🧠 Reasoning:\n" + "\n".join([f"{i+1}. {r}" for i, r in enumerate(s.get('reasoning', [])[:5])])
-
-    msg += f"\n\nMarket: {s.get('market_regime','').upper()} | F&G: {s.get('fear_greed')}"
-    msg += f"\nSource: {s.get('source', 'N/A')} | Hold: {s.get('holding_period', 'N/A')}"
-    msg += f"\nPullback: {s.get('pullback_pct', 0)}% | ATR: {s.get('atr_pct', 0)}%"
-    msg += f"\nAction: {s.get('action', 'N/A')}"
-
-    keyboard = None
-    if back_button:
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]]
-    await send_telegram_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
-
-# ==================== TELEGRAM HANDLERS ====================
-async def handle_buy(chat_id, user_id):
-    if PAYMENTS_ENABLED:
-        await send_telegram_message(chat_id, "Payment processing coming post-hackathon...")
-    else:
-        if is_pro(user_id):
-            await send_telegram_message(chat_id, "You're already Pro ✅")
-        else:
-            activate_pro(user_id, days=999)
-            await send_telegram_message(
-                chat_id,
-                "✅ DEMO MODE: Pro activated for hackathon judges\n\nAll features unlocked.\nTry /scan or /best now."
-            )
-
-async def handle_sell(chat_id, user_id):
-    if not is_pro(user_id):
-        await send_telegram_message(chat_id, "You're on Free plan. Nothing to cancel.")
-    else:
-        users_db[user_id]["plan"] = "free"
-        users_db[user_id]["pro_expires"] = None
-        await send_telegram_message(
-            chat_id,
-            "✅ DEMO: Pro subscription cancelled\n\nBack to Free plan.\nRe-upgrade: /buy"
-        )
-
-async def handle_scan(chat_id, user_id):
-    await scan_all(force=True)
-    await send_leaderboard(chat_id, include_back=True)
-
-async def handle_best(chat_id):
-    if time.time() - cache["last_scan"] > 120:
-        await scan_all()
-    async with cache_lock:
-        signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
-    if not signals:
-        await send_telegram_message(chat_id, "No signals yet. Scanning...")
-    else:
-        best = max(signals, key=lambda x: x.get("confidence", 0))
-        await send_rich_card(chat_id, best, back_button=True)
-
-async def handle_message(chat_id, text, user_id):
-    if not bot:
-        return
-
-    if text not in ["/start", "/buy", "/sell"] and not can_user_call(user_id):
-        await send_telegram_message(chat_id, "Free limit reached (5 calls/day). Upgrade to Pro with /buy.")
-        return
-
-    if text == "/start":
-        if time.time() - cache["last_scan"] > 300:
-            await scan_all()
-        signals = list(cache["signals"].values())
-        keyboard = [
-            [InlineKeyboardButton("📊 Scan Markets", callback_data="scan_all"),
-             InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
-            [InlineKeyboardButton("🔍 Best Signal", callback_data="best_signal")],
-            [InlineKeyboardButton("📈 BTC", callback_data="BTCUSDT"),
-             InlineKeyboardButton("📈 ETH", callback_data="ETHUSDT"),
-             InlineKeyboardButton("📈 SOL", callback_data="SOLUSDT")],
-            [InlineKeyboardButton("📈 BNB", callback_data="BNBUSDT"),
-             InlineKeyboardButton("📈 XRP", callback_data="XRPUSDT")],
-            [InlineKeyboardButton("📈 AVAX", callback_data="AVAXUSDT"),
-             InlineKeyboardButton("📈 DOGE", callback_data="DOGEUSDT")],
-            [InlineKeyboardButton("📈 TRX", callback_data="TRXUSDT"),
-             InlineKeyboardButton("📈 ADA", callback_data="ADAUSDT")],
-            [InlineKeyboardButton("📈 LINK", callback_data="LINKUSDT"),
-             InlineKeyboardButton("💎 Upgrade", callback_data="buy_cmd")]
-        ]
-        regime = cache["market_regime"].upper()
-        valid = [s for s in signals if s.get("confidence", 0) > 0]
-        top = max(valid, key=lambda x: x["confidence"]) if valid else None
-
-        msg = "🔮 CROO AI Oracle\n\n"
-        msg += f"Market: {regime} | F&G: {cache['fear_greed']}\n"
-        msg += f"Assets: {len(ASSETS)} monitored\n"
-        msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)\n"
-        msg += f"TP Strategy: Realistic 3-6% with 2:1+ R:R\n"
-        if top:
-            msg += f"\n🔥 Top: {top.get('asset')} {top.get('decision')} {top.get('confidence')}% ({top.get('grade')})\n"
-            msg += f"Price: ${top.get('price')} | Zone: {top.get('entry_zone')}\n"
-            msg += f"TP: ${top.get('take_profit')} | R:R: {top.get('risk_reward')}\n"
-            msg += f"Action: {top.get('action')}\n"
-        msg += "\n/scan /best /leaderboard /stats /force_scan /status /subscribe /usage"
-        await send_telegram_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif text in ["/scan", "/signals"]:
-        await handle_scan(chat_id, user_id)
-
-    elif text == "/best":
-        await handle_best(chat_id)
-
-    elif text == "/leaderboard":
-        await send_leaderboard(chat_id, include_back=True)
-
-    elif text == "/stats":
-        await send_stats(chat_id)
-
-    elif text == "/buy":
-        await handle_buy(chat_id, user_id)
-
-    elif text == "/sell":
-        await handle_sell(chat_id, user_id)
-
-    elif text == "/force_scan":
-        await scan_all(force=True)
-        await send_telegram_message(chat_id, "✅ Manual scan complete. Check /leaderboard for results.")
-
-    elif text == "/status":
-        uptime = str(timedelta(seconds=int(time.time() - start_time)))
-        last_scan = cache["last_successful_scan"]
-        last_scan_str = datetime.utcfromtimestamp(last_scan).isoformat() if last_scan else "Never"
-        active_ws = len([t for t in ws_tasks if not t.done()])
-        msg = f"📊 Agent Status\n\n"
-        msg += f"Uptime: {uptime}\n"
-        msg += f"Last Scan: {last_scan_str}\n"
-        msg += f"Signals Generated: {len(signal_history)}\n"
-        msg += f"Active WebSockets: {active_ws}\n"
-        msg += f"Telegram Queue: {telegram_queue.qsize()}\n"
-        await send_telegram_message(chat_id, msg)
-
-    elif text == "/subscribe":
-        msg = "💎 CROO Oracle Subscription\n\n"
-        msg += "Free Plan\n- 5 requests/day\n- Basic signals\n\n"
-        msg += "Pro Plan – $9.99/month\n- Unlimited requests\n- All assets\n- Entry zones & position sizing\n- Telegram alerts\n\n"
-        msg += "Enterprise – Custom pricing\n- Full API access\n- White-label\n- Dedicated support\n\n"
-        msg += "🔹 Hackathon Demo – All features unlocked for free!\n"
-        await send_telegram_message(chat_id, msg)
-
-    elif text == "/usage":
-        user = get_user(user_id)
-        used = user["calls_today"]
-        limit = 5 if user["plan"] == "free" else None
-        status = "Pro ✅" if user["plan"] in ["pro", "lifetime"] else f"Free – {used}/5 used today"
-        msg = f"📊 Your Usage\n\n"
-        msg += f"Plan: {user['plan'].upper()}\n"
-        msg += f"Status: {status}\n"
-        await send_telegram_message(chat_id, msg)
-
-    elif text.startswith("/why"):
-        parts = text.split()
-        if len(parts) > 1:
-            symbol = parts[1].upper()
-            await send_why(chat_id, symbol)
-
-    elif text == "/demo":
-        demo_data = await demo()
-        await send_telegram_message(chat_id, f"📊 DEMO STATUS\n\n{json.dumps(demo_data, indent=2)}")
-
-async def send_why(chat_id, symbol):
-    asset = symbol.upper() + "USDT"
-    if time.time() - cache["last_scan"] > 300:
-        await scan_all()
-    signal = cache["signals"].get(asset, {})
-    if not signal:
-        await send_telegram_message(chat_id, f"No data for {symbol}")
-        return
-
-    msg = f"🧠 WHY {symbol}?\n\n"
-    msg += f"Decision: {signal.get('decision')}\n"
-    msg += f"Bias: {signal.get('bias')}\n"
-    msg += f"Direction: {signal.get('direction')}\n"
-    msg += f"Confidence: {signal.get('confidence')}%\n"
-    msg += f"Risk: {signal.get('risk')}\n"
-    msg += f"Entry Zone: {signal.get('entry_zone')}\n"
-    msg += f"TP: ${signal.get('take_profit')}\n"
-    msg += f"SL: ${signal.get('stop_loss')}\n"
-    msg += f"R:R: {signal.get('risk_reward')}\n"
-    msg += f"ATR: {signal.get('atr_pct')}%\n"
-    msg += f"Action: {signal.get('action')}\n\n"
-
-    if signal.get('direction') == 'LONG':
-        msg += "Bullish:\n" + "\n".join([f"✅ {r}" for r in signal.get('bullish_reasons', [])[:5]])
-    else:
-        msg += "Bearish:\n" + "\n".join([f"✅ {r}" for r in signal.get('bearish_reasons', [])[:5]])
-
-    if signal.get('missing_conditions'):
-        msg += f"\n\nMissing:\n" + "\n".join([f"❌ {m}" for m in signal.get('missing_conditions', [])[:3]])
-
-    if signal.get('why_not_now'):
-        msg += f"\n\nWhy Not Now:\n" + "\n".join([f"⏳ {w}" for w in signal.get('why_not_now', [])[:3]])
-
-    if signal.get('reasoning'):
-        msg += "\n\n🧠 Reasoning:\n" + "\n".join([f"{i+1}. {r}" for i, r in enumerate(signal.get('reasoning', [])[:5])])
-
-    msg += f"\n\nMarket: {signal.get('market_regime', '').upper()} | F&G: {signal.get('fear_greed')}"
-    msg += f"\nPosition Sizing: {signal.get('position_sizing', 'N/A')}"
-    msg += f"\nHolding Period: {signal.get('holding_period', 'N/A')}"
-    await send_telegram_message(chat_id, msg)
-
-async def send_stats(chat_id):
-    await update_performance()
-    win_rate = performance["wins"] / max(1, performance["total"]) * 100
-    accuracy = round(win_rate, 1)
-    rep_score = win_rate * 0.7 + min(performance["total"], 100) * 0.3
-    rep_score = min(100, rep_score)
-    msg = f"📊 AGENT STATS\n\n"
-    msg += f"Total Signals: {performance['total']}\n"
-    msg += f"Wins: {performance['wins']}\n"
-    msg += f"Losses: {performance['losses']}\n"
-    msg += f"Win Rate: {accuracy}%\n"
-    msg += f"Reputation: {round(rep_score, 1)}%\n"
-    msg += f"Best Asset: {agent_memory['best_asset']} ({agent_memory['best_asset_win_rate']}%)\n"
-    msg += f"Market Regime: {cache['market_regime'].upper()}\n"
-    msg += f"Fear & Greed: {cache['fear_greed']}\n"
-    msg += f"Revenue Simulated: ${round(agent_memory['revenue_simulated'], 2)}\n"
-    msg += f"Memory: {agent_memory['total_calls']} calls\n"
-    msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)\n"
-    msg += f"TP Strategy: Realistic 3-6% with 2:1+ R:R\n"
-    msg += f"Volatility Filter: Active (ATR < 1% penalized)"
-    await send_telegram_message(chat_id, msg)
-
-async def handle_callback(chat_id, data, user_id):
-    if not bot:
-        return
-
-    if data == "back_to_menu":
-        await handle_message(chat_id, "/start", user_id)
-        return
-
-    if data == "scan_all":
-        await scan_all(force=True)
-        await send_leaderboard(chat_id, include_back=True)
-
-    elif data == "leaderboard":
-        await send_leaderboard(chat_id, include_back=True)
-
-    elif data == "best_signal":
-        if time.time() - cache["last_scan"] > 120:
-            await scan_all()
-        async with cache_lock:
-            signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
-        if not signals:
-            await send_telegram_message(chat_id, "No signals yet. Scanning...")
-        else:
-            best = max(signals, key=lambda x: x.get("confidence", 0))
-            await send_rich_card(chat_id, best, back_button=True)
-
-    elif data == "buy_cmd":
-        await handle_buy(chat_id, user_id)
-
-    elif data in ASSETS:
-        if time.time() - cache["last_scan"] > 300:
-            await scan_all()
-        s = cache["signals"].get(data, {})
-        if not s or s.get("confidence", 0) == 0:
-            await send_telegram_message(chat_id, f"No data for {data.replace('USDT','')} yet. Scanning...")
-        else:
-            await send_rich_card(chat_id, s, back_button=True)
-
-# ==================== PORTFOLIO ALLOCATION ====================
-def generate_portfolio(capital=1000):
-    signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
-    if not signals:
-        return {"error": "No signals available for allocation"}
-    top = sorted(signals, key=lambda x: x.get("confidence", 0), reverse=True)[:5]
-    total_conf = sum(s.get("confidence", 0) for s in top)
-    if total_conf <= 0:
-        return {"error": "Insufficient confidence"}
-    allocation = {}
-    for s in top:
-        weight = s.get("confidence", 0) / total_conf
-        allocation[s.get("asset")] = round(capital * weight, 2)
-    return allocation
-
-# ==================== A2A ENDPOINT ====================
+# ==================== A2A ENHANCED ====================
 @app.post("/a2a")
 async def a2a(request: Request):
     try:
@@ -1633,6 +1264,347 @@ async def a2a(request: Request):
         "from_agent": "CROO Oracle",
         "to_agent": agent
     }, status_code=400)
+
+# ==================== TELEGRAM FORMATTING ====================
+def decision_emoji(decision):
+    if decision == "BUY":
+        return "🟢"
+    elif decision == "SELL":
+        return "🔴"
+    else:
+        return "🔵"
+
+async def send_leaderboard(chat_id, include_back=True):
+    if time.time() - cache["last_scan"] > 300:
+        await scan_all()
+    signals = sorted(cache["signals"].values(), key=lambda x: x.get("confidence", 0), reverse=True)
+    regime = cache["market_regime"].upper()
+    fg = cache["fear_greed"]
+    msg = f"🏆 LEADERBOARD | {regime} | F&G: {fg}\n\n"
+
+    for i, s in enumerate(signals[:10], 1):
+        asset = s.get('asset', 'N/A')
+        decision = s.get('decision', 'HOLD')
+        conf = s.get('confidence', 0)
+        grade_str = s.get('grade', 'F')
+        price = s.get('price', 0)
+        entry_zone = s.get('entry_zone', 'N/A')
+        tp = s.get('take_profit', 0)
+        rr = s.get('risk_reward', 'N/A')
+        action = s.get('action', 'N/A')
+
+        emoji = decision_emoji(decision)
+        msg += f"{i}. {emoji} {asset} - {conf}% ({grade_str}) {decision}\n"
+        msg += f"   Price: ${price} | Zone: {entry_zone}\n"
+        msg += f"   TP: ${tp} | R:R: {rr}\n"
+        msg += f"   Action: {action}\n\n"   # <-- clean spacing, no separator
+
+    if include_back:
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]]
+        await send_telegram_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await send_telegram_message(chat_id, msg)
+
+async def send_rich_card(chat_id, s, back_button=True):
+    decision = s.get("decision", "HOLD")
+    if decision == "HOLD":
+        if s.get("bias") == "LONG":
+            msg = "⏳ HOLD (LONG BIAS)\n\n"
+        elif s.get("bias") == "SHORT":
+            msg = "⏳ HOLD (SHORT BIAS)\n\n"
+        else:
+            msg = "⏳ HOLD\n\n"
+    else:
+        msg = f"🚨 {decision} SIGNAL\n\n"
+
+    msg += f"Asset: {s.get('asset')}\n"
+    msg += f"Confidence: {s.get('confidence')}% ({s.get('grade')})\n"
+    msg += f"Risk: {s.get('risk')}\n"
+    msg += f"Price: ${s.get('price')}\n\n"
+    msg += f"Entry Zone: {s.get('entry_zone')}\n"
+    msg += f"Entry: ${s.get('entry')}\n"
+    msg += f"Target: ${s.get('take_profit')}\n"
+    msg += f"Stop: ${s.get('stop_loss')}\n"
+    msg += f"R:R: {s.get('risk_reward')}\n\n"
+    msg += f"Position Sizing:\n{s.get('position_sizing')}\n\n"
+
+    if s.get('direction') == 'LONG':
+        msg += f"Bullish Reasons:\n" + "\n".join([f"✅ {r}" for r in s.get('bullish_reasons', ['None'])[:5]])
+    else:
+        msg += f"Bearish Reasons:\n" + "\n".join([f"✅ {r}" for r in s.get('bearish_reasons', ['None'])[:5]])
+
+    if s.get('missing_conditions'):
+        msg += "\n\nMissing Conditions:\n" + "\n".join([f"❌ {m}" for m in s.get('missing_conditions', [])[:3]])
+
+    if s.get('why_not_now'):
+        msg += "\n\nWhy Not Now:\n" + "\n".join([f"⏳ {w}" for w in s.get('why_not_now', [])[:3]])
+
+    if s.get('reasoning'):
+        msg += "\n\n🧠 Reasoning:\n" + "\n".join([f"{i+1}. {r}" for i, r in enumerate(s.get('reasoning', [])[:5])])
+
+    msg += f"\n\nMarket: {s.get('market_regime','').upper()} | F&G: {s.get('fear_greed')}"
+    msg += f"\nSource: {s.get('source', 'N/A')} | Hold: {s.get('holding_period', 'N/A')}"
+    msg += f"\nPullback: {s.get('pullback_pct', 0)}% | ATR: {s.get('atr_pct', 0)}%"
+    msg += f"\nAction: {s.get('action', 'N/A')}"
+
+    keyboard = None
+    if back_button:
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]]
+    await send_telegram_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
+async def handle_buy(chat_id, user_id):
+    if PAYMENTS_ENABLED:
+        await send_telegram_message(chat_id, "Payment processing coming post-hackathon...")
+    else:
+        if is_pro(user_id):
+            await send_telegram_message(chat_id, "You're already Pro ✅")
+        else:
+            activate_pro(user_id, days=999)
+            await send_telegram_message(
+                chat_id,
+                "✅ DEMO MODE: Pro activated for hackathon judges\n\nAll features unlocked.\nTry /scan or /best now."
+            )
+
+async def handle_sell(chat_id, user_id):
+    if not is_pro(user_id):
+        await send_telegram_message(chat_id, "You're on Free plan. Nothing to cancel.")
+    else:
+        users_db[user_id]["plan"] = "free"
+        users_db[user_id]["pro_expires"] = None
+        await send_telegram_message(
+            chat_id,
+            "✅ DEMO: Pro subscription cancelled\n\nBack to Free plan.\nRe-upgrade: /buy"
+        )
+
+# ==================== TELEGRAM MESSAGE HANDLER ====================
+async def handle_message(chat_id, text, user_id):
+    if not bot:
+        return
+
+    # Rate-limit free users (except for /start, /buy, /sell)
+    if text not in ["/start", "/buy", "/sell"] and not can_user_call(user_id):
+        await send_telegram_message(chat_id, "Free limit reached (5 calls/day). Upgrade to Pro with /buy.")
+        return
+
+    if text == "/start":
+        if time.time() - cache["last_scan"] > 300:
+            await scan_all()
+        signals = list(cache["signals"].values())
+        keyboard = [
+            [InlineKeyboardButton("📊 Scan Markets", callback_data="scan_all"),
+             InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
+            [InlineKeyboardButton("🔍 Best Signal", callback_data="best_signal")],
+            [InlineKeyboardButton("📈 BTC", callback_data="BTCUSDT"),
+             InlineKeyboardButton("📈 ETH", callback_data="ETHUSDT"),
+             InlineKeyboardButton("📈 SOL", callback_data="SOLUSDT")],
+            [InlineKeyboardButton("📈 BNB", callback_data="BNBUSDT"),
+             InlineKeyboardButton("📈 XRP", callback_data="XRPUSDT")],
+            [InlineKeyboardButton("📈 AVAX", callback_data="AVAXUSDT"),
+             InlineKeyboardButton("📈 DOGE", callback_data="DOGEUSDT")],
+            [InlineKeyboardButton("📈 TRX", callback_data="TRXUSDT"),
+             InlineKeyboardButton("📈 ADA", callback_data="ADAUSDT")],
+            [InlineKeyboardButton("📈 LINK", callback_data="LINKUSDT"),
+             InlineKeyboardButton("💎 Upgrade", callback_data="buy_cmd")]
+        ]
+        regime = cache["market_regime"].upper()
+        top = max(signals, key=lambda x: x.get("confidence", 0)) if signals else None
+
+        msg = "🔮 CROO AI Oracle\n\n"
+        msg += f"Market: {regime} | F&G: {cache['fear_greed']}\n"
+        msg += f"Assets: {len(ASSETS)} monitored\n"
+        msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)\n"
+        msg += f"TP Strategy: Realistic 3-6% with 2:1+ R:R\n"
+        if top and top.get("confidence", 0) > 0:
+            msg += f"\n🔥 Top: {top.get('asset')} {top.get('decision')} {top.get('confidence')}% ({top.get('grade')})\n"
+            msg += f"Price: ${top.get('price')} | Zone: {top.get('entry_zone')}\n"
+            msg += f"TP: ${top.get('take_profit')} | R:R: {top.get('risk_reward')}\n"
+            msg += f"Action: {top.get('action')}\n"
+        msg += "\n/scan /best /leaderboard /stats /force_scan /status /subscribe /usage"
+        await send_telegram_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif text in ["/scan", "/signals"]:
+        await scan_all(force=True)
+        await send_leaderboard(chat_id, include_back=True)
+
+    elif text == "/best":
+        if time.time() - cache["last_scan"] > 120:
+            await scan_all()
+        signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
+        if not signals:
+            await send_telegram_message(chat_id, "No signals yet. Scanning...")
+        else:
+            await send_rich_card(chat_id, max(signals, key=lambda x: x.get("confidence", 0)), back_button=True)
+
+    elif text == "/leaderboard":
+        await send_leaderboard(chat_id, include_back=True)
+
+    elif text == "/stats":
+        await send_stats(chat_id)
+
+    elif text == "/buy":
+        await handle_buy(chat_id, user_id)
+
+    elif text == "/sell":
+        await handle_sell(chat_id, user_id)
+
+    elif text == "/force_scan":
+        await scan_all(force=True)
+        await send_telegram_message(chat_id, "✅ Manual scan complete. Check /leaderboard for results.")
+
+    elif text == "/status":
+        uptime = str(timedelta(seconds=int(time.time() - start_time)))
+        last_scan = cache["last_successful_scan"]
+        last_scan_str = datetime.utcfromtimestamp(last_scan).isoformat() if last_scan else "Never"
+        active_ws = len([t for t in ws_tasks if not t.done()])
+        msg = f"📊 Agent Status\n\n"
+        msg += f"Uptime: {uptime}\n"
+        msg += f"Last Scan: {last_scan_str}\n"
+        msg += f"Signals Generated: {len(signal_history)}\n"
+        msg += f"Active WebSockets: {active_ws}\n"
+        msg += f"Telegram Queue: {telegram_queue.qsize()}\n"
+        await send_telegram_message(chat_id, msg)
+
+    elif text == "/subscribe":
+        msg = "💎 CROO Oracle Subscription\n\n"
+        msg += "Free Plan\n- 5 requests/day\n- Basic signals\n\n"
+        msg += "Pro Plan – $9.99/month\n- Unlimited requests\n- All assets\n- Entry zones & position sizing\n- Telegram alerts\n\n"
+        msg += "Enterprise – Custom pricing\n- Full API access\n- White-label\n- Dedicated support\n\n"
+        msg += "🔹 Hackathon Demo – All features unlocked for free!\n"
+        await send_telegram_message(chat_id, msg)
+
+    elif text == "/usage":
+        user = get_user(user_id)
+        used = user["calls_today"]
+        limit = 5 if user["plan"] == "free" else "unlimited"
+        status = "Pro ✅" if user["plan"] in ["pro", "lifetime"] else f"Free – {used}/5 used today"
+        msg = f"📊 Your Usage\n\n"
+        msg += f"Plan: {user['plan'].upper()}\n"
+        msg += f"Status: {status}\n"
+        await send_telegram_message(chat_id, msg)
+
+    elif text.startswith("/why"):
+        parts = text.split()
+        if len(parts) > 1:
+            symbol = parts[1].upper()
+            await send_why(chat_id, symbol)
+
+    elif text == "/demo":
+        demo_data = await demo()
+        await send_telegram_message(chat_id, f"📊 DEMO STATUS\n\n{json.dumps(demo_data, indent=2)}")
+
+async def send_why(chat_id, symbol):
+    asset = symbol.upper() + "USDT"
+    if time.time() - cache["last_scan"] > 300:
+        await scan_all()
+    signal = cache["signals"].get(asset, {})
+    if not signal:
+        await send_telegram_message(chat_id, f"No data for {symbol}")
+        return
+
+    msg = f"🧠 WHY {symbol}?\n\n"
+    msg += f"Decision: {signal.get('decision')}\n"
+    msg += f"Bias: {signal.get('bias')}\n"
+    msg += f"Direction: {signal.get('direction')}\n"
+    msg += f"Confidence: {signal.get('confidence')}%\n"
+    msg += f"Risk: {signal.get('risk')}\n"
+    msg += f"Entry Zone: {signal.get('entry_zone')}\n"
+    msg += f"TP: ${signal.get('take_profit')}\n"
+    msg += f"SL: ${signal.get('stop_loss')}\n"
+    msg += f"R:R: {signal.get('risk_reward')}\n"
+    msg += f"ATR: {signal.get('atr_pct')}%\n"
+    msg += f"Action: {signal.get('action')}\n\n"
+
+    if signal.get('direction') == 'LONG':
+        msg += "Bullish:\n" + "\n".join([f"✅ {r}" for r in signal.get('bullish_reasons', [])[:5]])
+    else:
+        msg += "Bearish:\n" + "\n".join([f"✅ {r}" for r in signal.get('bearish_reasons', [])[:5]])
+
+    if signal.get('missing_conditions'):
+        msg += f"\n\nMissing:\n" + "\n".join([f"❌ {m}" for m in signal.get('missing_conditions', [])[:3]])
+
+    if signal.get('why_not_now'):
+        msg += f"\n\nWhy Not Now:\n" + "\n".join([f"⏳ {w}" for w in signal.get('why_not_now', [])[:3]])
+
+    if signal.get('reasoning'):
+        msg += "\n\n🧠 Reasoning:\n" + "\n".join([f"{i+1}. {r}" for i, r in enumerate(signal.get('reasoning', [])[:5])])
+
+    msg += f"\n\nMarket: {signal.get('market_regime', '').upper()} | F&G: {signal.get('fear_greed')}"
+    msg += f"\nPosition Sizing: {signal.get('position_sizing', 'N/A')}"
+    msg += f"\nHolding Period: {signal.get('holding_period', 'N/A')}"
+    await send_telegram_message(chat_id, msg)
+
+async def send_stats(chat_id):
+    await update_performance()
+    win_rate = performance["wins"] / max(1, performance["total"]) * 100
+    accuracy = round(win_rate, 1)
+    rep_score = win_rate * 0.7 + min(performance["total"], 100) * 0.3
+    rep_score = min(100, rep_score)
+    msg = f"📊 AGENT STATS\n\n"
+    msg += f"Total Signals: {performance['total']}\n"
+    msg += f"Wins: {performance['wins']}\n"
+    msg += f"Losses: {performance['losses']}\n"
+    msg += f"Win Rate: {accuracy}%\n"
+    msg += f"Reputation: {round(rep_score, 1)}%\n"
+    msg += f"Best Asset: {agent_memory['best_asset']} ({agent_memory['best_asset_win_rate']}%)\n"
+    msg += f"Market Regime: {cache['market_regime'].upper()}\n"
+    msg += f"Fear & Greed: {cache['fear_greed']}\n"
+    msg += f"Revenue Simulated: ${round(agent_memory['revenue_simulated'], 2)}\n"
+    msg += f"Memory: {agent_memory['total_calls']} calls\n"
+    msg += f"Entry Strategy: Zone-based (0.5-1% below/above current)\n"
+    msg += f"TP Strategy: Realistic 3-6% with 2:1+ R:R\n"
+    msg += f"Volatility Filter: Active (ATR < 1% penalized)"
+    await send_telegram_message(chat_id, msg)
+
+async def handle_callback(chat_id, data, user_id):
+    if not bot:
+        return
+
+    if data == "back_to_menu":
+        await handle_message(chat_id, "/start", user_id)
+        return
+
+    if data == "scan_all":
+        await scan_all(force=True)
+        await send_leaderboard(chat_id, include_back=True)
+
+    elif data == "leaderboard":
+        await send_leaderboard(chat_id, include_back=True)
+
+    elif data == "best_signal":
+        if time.time() - cache["last_scan"] > 120:
+            await scan_all()
+        signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
+        if not signals:
+            await send_telegram_message(chat_id, "No signals yet. Scanning...")
+        else:
+            await send_rich_card(chat_id, max(signals, key=lambda x: x.get("confidence", 0)), back_button=True)
+
+    elif data == "buy_cmd":
+        await handle_buy(chat_id, user_id)
+
+    elif data in ASSETS:
+        if time.time() - cache["last_scan"] > 300:
+            await scan_all()
+        s = cache["signals"].get(data, {})
+        if not s or s.get("confidence", 0) == 0:
+            await send_telegram_message(chat_id, f"No data for {data.replace('USDT','')} yet. Scanning...")
+        else:
+            await send_rich_card(chat_id, s, back_button=True)
+
+# ==================== PORTFOLIO ALLOCATION ====================
+def generate_portfolio(capital=1000):
+    signals = [s for s in cache["signals"].values() if s.get("confidence", 0) > 0]
+    if not signals:
+        return {"error": "No signals available for allocation"}
+    top = sorted(signals, key=lambda x: x.get("confidence", 0), reverse=True)[:5]
+    total_conf = sum(s.get("confidence", 0) for s in top)
+    if total_conf == 0:
+        return {"error": "Insufficient confidence"}
+    allocation = {}
+    for s in top:
+        weight = s.get("confidence", 0) / total_conf
+        allocation[s.get("asset")] = round(capital * weight, 2)
+    return allocation
 
 # ==================== API ENDPOINTS ====================
 
@@ -1751,7 +1723,7 @@ async def stats_api():
 
 @app.get("/history")
 def history():
-    return list(signal_history)[-50:]
+    return signal_history[-50:]
 
 @app.post("/agent/query")
 async def agent_query(req: Request):
@@ -1965,10 +1937,7 @@ async def portfolio(req: Request):
     if not signals:
         return JSONResponse({"error": "No signals for portfolio allocation"})
 
-    total_conf = sum(s.get("confidence", 0) for s in signals[:5])
-    if total_conf <= 0:
-        return JSONResponse({"error": "No valid confidence"})
-
+    total_conf = sum(s.get("confidence", 0) for s in signals[:5]) or 1
     allocation = {}
     for s in signals[:5]:
         weight = s.get("confidence", 0) / total_conf
