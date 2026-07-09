@@ -2208,31 +2208,22 @@ def agent_manifest():
 
 # ==================== TELEGRAM WEBHOOK ====================
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
-    try:
-        data = await request.json()
-        
-        # 1. Telegram sends 6+ update types. Only handle messages with text
-        message = data.get("message") or data.get("edited_message")
-        if not message or "text" not in message:
-            return JSONResponse({"ok": True})  # <--- KEY: Always return 200
-            
-        text = message["text"].strip()
-        user_id = message["from"]["id"]
-        
-        if not text:
-            return JSONResponse({"ok": True})
-            
-        # 2. Your command handling here
-        if text == "/start":
-            await send_telegram_message(user_id, "CROO AI Oracle v10 Online")
-        
-        return JSONResponse({"ok": True})
-        
-    except Exception as e:
-        # 3. NEVER let an exception become a 500. Log it, return 200
-        print(f"Webhook caught error: {e}")
-        return JSONResponse({"ok": True})
+async def webhook(request: Request):
+    if SECRET_TOKEN != "default_secret":
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if token != SECRET_TOKEN:
+            raise HTTPException(status_code=403, detail="Unauthorized")
+    data = await request.json()
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "")
+        user_id = data["message"]["from"]["id"]
+        await handle_message(chat_id, text, user_id)
+    elif "callback_query" in data:
+        query = data["callback_query"]
+        await handle_callback(query["message"]["chat"]["id"], query["data"], query["from"]["id"])
+    return JSONResponse({"ok": True})
+
 # ==================== STARTUP BANNER ====================
 def print_startup_banner():
     print("=" * 50)
