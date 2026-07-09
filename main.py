@@ -1,6 +1,3 @@
-I'll clean up the code by removing all references to "v10" or "v11" and making it neater and cleaner. Here's the refactored version:
-
-```python
 import os
 import time
 import asyncio
