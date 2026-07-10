@@ -588,13 +588,8 @@ def calculate_entries(price, atr, direction="LONG", signal_type="BUY"):
         atr_stop = max(price * 0.025, atr * 2)
         stop_loss = round(recommended - atr_stop, 4)
         risk = recommended - stop_loss
-        tp_1 = round(recommended + (risk * 1.5), 4)
-        tp_2 = round(recommended + (risk * 2.0), 4)
-        tp_3 = round(recommended + (risk * 2.5), 4)
-        volatility_factor = min(0.06, atr / price * 4)
-        tp_fixed = round(recommended * (1 + volatility_factor), 4)
-        take_profit = min(tp_3, tp_fixed)
-        take_profit = max(take_profit, round(recommended * 1.02, 4))
+        # Standard 2.5:1 reward-to-risk take-profit target
+        take_profit = round(recommended + (risk * 2.5), 4)
         reward = take_profit - recommended
         risk_reward = round(reward / risk, 2) if risk > 0 else 0
         position_sizing = "50% moderate, 30% conservative, 20% DCA"
@@ -611,13 +606,8 @@ def calculate_entries(price, atr, direction="LONG", signal_type="BUY"):
         atr_stop = max(price * 0.025, atr * 2)
         stop_loss = round(recommended + atr_stop, 4)
         risk = stop_loss - recommended
-        tp_1 = round(recommended - (risk * 1.5), 4)
-        tp_2 = round(recommended - (risk * 2.0), 4)
-        tp_3 = round(recommended - (risk * 2.5), 4)
-        volatility_factor = min(0.06, atr / price * 4)
-        tp_fixed = round(recommended * (1 - volatility_factor), 4)
-        take_profit = max(tp_3, tp_fixed)
-        take_profit = min(take_profit, round(recommended * 0.98, 4))
+        # Standard 2.5:1 reward-to-risk take-profit target
+        take_profit = round(recommended - (risk * 2.5), 4)
         reward = recommended - take_profit
         risk_reward = round(reward / risk, 2) if risk > 0 else 0
         position_sizing = "50% moderate, 30% conservative, 20% DCA"
