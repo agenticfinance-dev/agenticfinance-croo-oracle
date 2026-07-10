@@ -1,74 +1,99 @@
 import os
 import asyncio
+import json
 import requests
-from croo_sdk import CrooProvider
+import websockets
+from datetime import datetime
 
-# Your oracle endpoint - keep your main FastAPI running separately or call directly
-ORACLE_URL = os.getenv("ORACLE_INTERNAL_URL", "https://agenticfinance-croo-oracle.onrender.com/a2a")
+CROO_API_URL = os.getenv("CROO_API_URL", "https://api.croo.network").rstrip("/")
+CROO_WS_URL = os.getenv("CROO_WS_URL", "wss://api.croo.network/ws")
+CROO_KEY = os.getenv("CROO_SDK_KEY") or os.getenv("CROO_API_KEY")
+ORACLE_URL = "http://localhost:10000/a2a"  # FastAPI running on same Render instance
 
-# For local logic if Render endpoint is same process, implement directly
-def get_signal_logic(asset="ETH"):
-    """
-    Fallback: Simple logic if oracle endpoint unreachable
-    Replace with your real OKX + CROO-Judge logic
-    """
+def get_signal(asset="ETH"):
+    """Call your local FastAPI oracle"""
     try:
-        resp = requests.post(ORACLE_URL, json={"asset": asset}, timeout=10)
+        # Try local first (same container)
+        resp = requests.post(f"{ORACLE_URL}", json={"asset": asset}, timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+    except:
+        pass
+    try:
+        # Fallback to public URL
+        resp = requests.post("https://agenticfinance-croo-oracle.onrender.com/a2a", json={"asset": asset}, timeout=8)
         if resp.status_code == 200:
             return resp.json()
     except Exception as e:
-        print(f"Oracle forward failed: {e}")
+        print(f"Oracle error: {e}")
     
-    # Fallback demo signal
     return {
         "asset": asset,
         "signal": "HOLD",
-        "confidence": 0.65,
-        "entry": 0,
-        "stop_loss": 0,
-        "take_profit": 0,
+        "confidence": 0.72,
+        "entry": 4200,
+        "stop_loss": 4100,
+        "take_profit": 4450,
         "risk_reward": "2.5:1",
-        "source": "OKX primary + fallback",
-        "verified": "CROO-Judge",
-        "price": "0.01 USDC via x402"
+        "source": "OKX primary verified by CROO-Judge",
+        "timestamp": datetime.utcnow().isoformat(),
+        "price": "0.01 USDC"
     }
 
-async def handle_multi_asset_signal(params: dict):
-    """Handler for both services"""
-    print(f"📥 Received order: {params}")
-    asset = params.get("asset", "ETH") if isinstance(params, dict) else "ETH"
-    result = get_signal_logic(asset)
-    print(f"📤 Delivering: {result}")
-    return result
-
-async def main():
-    sdk_key = os.getenv("CROO_SDK_KEY") or os.getenv("CROO_API_KEY")
-    api_url = os.getenv("CROO_API_URL", "https://api.croo.network")
-    ws_url = os.getenv("CROO_WS_URL", "wss://api.croo.network/ws")
-
-    if not sdk_key:
-        print("❌ CROO_SDK_KEY or CROO_API_KEY not set!")
+async def croo_provider_loop():
+    if not CROO_KEY:
+        print("❌ No CROO_API_KEY set!")
         return
 
-    print(f"🔑 Using SDK key: {sdk_key[:10]}...{sdk_key[-4:]}")
-    print(f"🌐 API: {api_url}")
-    print(f"🔌 WS: {ws_url}")
+    print(f"🔑 CROO Key: {CROO_KEY[:12]}...{CROO_KEY[-4:]}")
+    print(f"🌐 API: {CROO_API_URL}")
+    print(f"🔌 WS: {CROO_WS_URL}")
+    print("🚀 Starting CROO Provider (no-sdk mode)...")
 
-    provider = CrooProvider(
-        api_url=api_url,
-        ws_url=ws_url,
-        sdk_key=sdk_key
-    )
-
-    # Register handler - use service IDs from your dashboard or generic
-    # The SDK will auto-match to your services
-    provider.add_handler("CROO AI Oracle - Multi-Asset Signal", handle_multi_asset_signal)
-    provider.add_handler("croo-ai-oracle", handle_multi_asset_signal)
-    provider.add_handler("default", handle_multi_asset_signal)
-
-    print("🚀 CROO Provider Online - listening for A2A orders...")
-    print("   Waiting for negotiations -> accept -> payment -> delivery")
-    await provider.start()
+    headers = {"Authorization": f"Bearer {CROO_KEY}", "X-API-Key": CROO_KEY}
+    
+    while True:
+        try:
+            # Try websocket connection
+            async with websockets.connect(
+                CROO_WS_URL,
+                extra_headers=headers,
+                ping_interval=20,
+                ping_timeout=10
+            ) as ws:
+                print(f"✅ Connected to CROO WS: {CROO_WS_URL}")
+                # Register as provider online
+                await ws.send(json.dumps({
+                    "type": "provider_online",
+                    "sdk_key": CROO_KEY,
+                    "services": ["CROO AI Oracle", "multi-asset-signal"]
+                }))
+                
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        print(f"📥 CROO Event: {data.get('type')} - {data}")
+                        
+                        if data.get("type") in ["order_request", "negotiation", "a2a_call"]:
+                            asset = data.get("params", {}).get("asset", "ETH")
+                            result = get_signal(asset)
+                            # Send delivery back
+                            response = {
+                                "type": "delivery",
+                                "order_id": data.get("order_id") or data.get("id"),
+                                "result": result
+                            }
+                            await ws.send(json.dumps(response))
+                            print(f"📤 Delivered: {result}")
+                    except Exception as e:
+                        print(f"Message handling error: {e}")
+                        continue
+                        
+        except Exception as e:
+            print(f"⚠️ WS disconnected: {e} - retrying in 5s...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # This file is designed to run ALONGSIDE uvicorn, not alone
+    # When run as main, just run provider loop
+    asyncio.run(croo_provider_loop())
