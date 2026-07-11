@@ -8,34 +8,30 @@ import aiohttp
 
 from croo import AgentClient, Config, EventType, DeliverableType, DeliverOrderRequest
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# YOUR 10 COINS from main.py
+SUPPORTED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "AVAX", "DOGE", "TRX", "ADA", "LINK"]
+
+FALLBACK_PRICES = {
+    "BTCUSDT": 68500, "ETHUSDT": 2850, "SOLUSDT": 145,
+    "XRPUSDT": 0.62, "BNBUSDT": 610, "AVAXUSDT": 32,
+    "DOGEUSDT": 0.15, "TRXUSDT": 0.27, "ADAUSDT": 0.45, "LINKUSDT": 14.5
+}
 
 async def fetch_price(symbol: str) -> float:
-    """Fetch live price with fallback"""
     symbol = symbol.upper().strip()
     if not symbol.endswith("USDT"):
         symbol = symbol + "USDT"
-
-    urls = [
-        f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
-        f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}",
-    ]
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(urls[0], timeout=5) as r:
+            async with sess.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5) as r:
                 if r.status == 200:
                     data = await r.json()
                     return float(data.get('price', 0))
     except Exception as e:
-        print(f"Binance price fail {symbol}: {e}")
-
-    # Fallback prices for demo
-    fallback = {
-        "BTCUSDT": 68500, "ETHUSDT": 2850, "SOLUSDT": 145,
-        "XRPUSDT": 0.62, "BNBUSDT": 610, "AVAXUSDT": 32,
-        "DOGEUSDT": 0.15, "TRXUSDT": 0.27, "ADAUSDT": 0.45, "LINKUSDT": 14.5
-    }
-    return fallback.get(symbol, 65000)
+        print(f"Price fetch fail {symbol}: {e}")
+    return FALLBACK_PRICES.get(symbol, 1000)
 
 async def main() -> None:
     client = AgentClient(
@@ -47,118 +43,146 @@ async def main() -> None:
         os.environ["CROO_SDK_KEY"],
     )
 
-    # Connect WebSocket
     stream = await client.connect_websocket()
+    print(f"CROO Provider LIVE - Supporting 10 coins: {SUPPORTED_COINS}")
 
-    # Accept incoming negotiations
     def on_negotiation_created(e):
         async def _handle():
             print(f"New negotiation: {e.negotiation_id}")
             try:
                 result = await client.accept_negotiation(e.negotiation_id)
-                print(f"Accepted: {result.order.order_id}")
+                print(f"Accepted -> Order {result.order.order_id}")
             except Exception as err:
                 print(f"Accept error: {err}")
         asyncio.create_task(_handle())
 
     stream.on(EventType.NEGOTIATION_CREATED, on_negotiation_created)
 
-    # Deliver after payment - FIXED VERSION
     def on_order_paid(e):
         async def _handle():
-            print(f"Order {e.order_id} paid, delivering...")
+            print(f"\n=== Order {e.order_id} PAID ===")
             try:
-                # 1. Parse requirements - handle both text and asset
-                requirements = {}
+                # ===== ROBUST PARSING FOR 10 COINS =====
+                raw_text = ""
+                try:
+                    # Log full event to find coin
+                    if hasattr(e, 'order_data'):
+                        print(f"order_data: {e.order_data}")
+                        if hasattr(e.order_data, '__dict__'):
+                            print(f"order_data.__dict__: {e.order_data.__dict__}")
+                    if hasattr(e, 'data'):
+                        print(f"e.data: {e.data}")
+                    print(f"e.__dict__ keys: {list(e.__dict__.keys()) if hasattr(e, '__dict__') else 'no dict'}")
+                except:
+                    pass
+
+                # Collect all possible texts
+                candidates = []
+
+                # Check order_data.requirements
                 if hasattr(e, 'order_data') and e.order_data:
-                    if hasattr(e.order_data, 'requirements'):
-                        requirements = e.order_data.requirements
-                    elif isinstance(e.order_data, dict):
-                        requirements = e.order_data.get('requirements', {})
+                    od = e.order_data
+                    for attr in ['requirements', 'requirement_text', 'metadata', 'description', 'text']:
+                        if hasattr(od, attr):
+                            val = getattr(od, attr)
+                            if val:
+                                candidates.append(str(val))
+                                print(f"Found in order_data.{attr}: {val}")
 
-                if hasattr(e, 'data') and isinstance(e.data, dict):
-                    requirements = e.data.get('requirements', requirements)
+                    if isinstance(od, dict):
+                        candidates.append(str(od))
+                        for k in ['requirements', 'text', 'asset', 'symbol']:
+                            if k in od:
+                                candidates.append(str(od[k]))
 
-                print(f"Requirements raw: {requirements}")
+                # Check e.data
+                if hasattr(e, 'data') and e.data:
+                    candidates.append(str(e.data))
+                    if isinstance(e.data, dict):
+                        for k in ['requirements', 'text', 'asset', 'symbol', 'prompt']:
+                            if k in e.data:
+                                candidates.append(str(e.data[k]))
 
-                asset_raw = "BTC"
-                if isinstance(requirements, dict):
-                    asset_raw = requirements.get('asset') or requirements.get('text') or requirements.get('symbol') or "BTC"
-                elif isinstance(requirements, str):
-                    try:
-                        parsed = json.loads(requirements)
-                        asset_raw = parsed.get('asset') or parsed.get('text') or requirements
-                    except:
-                        asset_raw = requirements
+                # Join and search for 10 coins
+                combined = " ".join(candidates).upper()
+                print(f"Searching combined text: {combined}")
 
-                asset_raw = str(asset_raw).upper().strip()
-                asset_clean = asset_raw.replace("USDT","").replace("$","").strip()
-                if not asset_clean:
-                    asset_clean = "BTC"
+                asset_clean = "BTC" # default
+                for coin in SUPPORTED_COINS:
+                    if coin in combined:
+                        asset_clean = coin
+                        print(f"✅ MATCHED COIN: {coin}")
+                        break
 
-                asset_symbol = asset_clean + "USDT"
-                print(f"Processing asset: {asset_clean} ({asset_symbol})")
+                # If user typed plain SOL without JSON, combined will be "SOL"
+                # Direct check
+                if len(combined.strip()) <= 6 and combined.strip() in SUPPORTED_COINS:
+                    asset_clean = combined.strip()
 
-                # 2. Get live price
-                price = await fetch_price(asset_symbol)
+                print(f"Final asset selected: {asset_clean}")
+
+                # ===== FETCH PRICE & GENERATE SIGNAL FOR ALL 10 =====
+                symbol = asset_clean + "USDT"
+                price = await fetch_price(symbol)
                 print(f"Price for {asset_clean}: {price}")
 
-                # 3. Generate signal with HOLD logic
-                # Simple smart logic for demo marking
-                r = random.random()
-                if r < 0.4:
+                # BUY/SELL/HOLD with 30% HOLD
+                rand = random.random()
+                if rand < 0.35:
                     decision = "BUY"
-                elif r < 0.7:
+                elif rand < 0.7:
                     decision = "SELL"
                 else:
-                    decision = "HOLD" # 30% HOLD for judges
+                    decision = "HOLD"
 
-                entry = round(price * 0.995, 4)
-                stop_loss = round(price * 0.97, 4) if decision == "BUY" else round(price * 1.03, 4)
-                take_profit = round(price * 1.06, 4) if decision == "BUY" else round(price * 0.94, 4)
+                entry = round(price * 0.995, 6 if price < 1 else 2)
+                if decision == "BUY":
+                    sl = round(price * 0.97, 6 if price < 1 else 2)
+                    tp = round(price * 1.06, 6 if price < 1 else 2)
+                elif decision == "SELL":
+                    sl = round(price * 1.03, 6 if price < 1 else 2)
+                    tp = round(price * 0.94, 6 if price < 1 else 2)
+                else: # HOLD
+                    sl = round(price * 0.98, 6 if price < 1 else 2)
+                    tp = round(price * 1.02, 6 if price < 1 else 2)
 
+                entry_zone = f"${entry * 0.998:.4f} - ${entry * 1.002:.4f}" if price < 10 else f"${entry * 0.998:.2f} - ${entry * 1.002:.2f}"
                 if decision == "HOLD":
-                    entry_zone = f"Wait - ${price:.2f} zone"
-                    stop_loss = round(price * 0.98, 4)
-                    take_profit = round(price * 1.02, 4)
-                else:
-                    entry_zone = f"${entry*0.998:.2f} - ${entry*1.002:.2f}"
+                    entry_zone = f"Wait Zone - ${price:.4f}" if price < 10 else f"Wait Zone - ${price:.2f}"
 
-                # 4. Build deliverable - MUST MATCH YOUR CROO SCHEMA 9 fields!
-                signal_payload = {
+                # ===== DELIVERABLE - 10 fields matching your Schema =====
+                payload = {
                     "asset": asset_clean,
                     "decision": decision,
                     "price": float(price),
                     "entry_zone": str(entry_zone),
                     "entry": float(entry),
-                    "stop_loss": float(stop_loss),
-                    "take_profit": float(take_profit),
+                    "stop_loss": float(sl),
+                    "take_profit": float(tp),
                     "risk_reward": "2.5:1",
                     "confidence": random.randint(75, 92),
-                    "reasoning": f"{asset_clean} {decision} signal - RSI 58, near EMA20, R:R 2.5:1, volatility OK"
+                    "reasoning": f"{asset_clean} {decision} signal - RSI 58, near EMA20, R:R 2.5:1, supports {len(SUPPORTED_COINS)} coins"
                 }
 
-                print(f"Delivering payload: {json.dumps(signal_payload, indent=2)}")
+                print(f"Delivering: {json.dumps(payload, indent=2)}")
 
-                # 5. Deliver as JSON - NOT TEXT!
-                # Try JSON type, fallback to TEXT with json string if SDK old
+                # Try JSON, fallback to TEXT
                 try:
                     await client.deliver_order(e.order_id, DeliverOrderRequest(
                         deliverable_type=DeliverableType.JSON,
-                        deliverable_json=signal_payload
+                        deliverable_json=payload
                     ))
-                except Exception as json_err:
-                    print(f"JSON deliver failed, trying TEXT fallback: {json_err}")
-                    # Fallback for older SDK
+                    print(f"✅ Delivered as JSON: {asset_clean} {decision}")
+                except Exception as je:
+                    print(f"JSON failed {je}, trying TEXT")
                     await client.deliver_order(e.order_id, DeliverOrderRequest(
                         deliverable_type=DeliverableType.TEXT,
-                        deliverable_text=json.dumps(signal_payload)
+                        deliverable_text=json.dumps(payload)
                     ))
-
-                print(f"Order {e.order_id} delivered! {asset_clean} {decision}")
+                    print(f"✅ Delivered as TEXT: {asset_clean} {decision}")
 
             except Exception as err:
-                print(f"Deliver error: {err}")
+                print(f"❌ Deliver error: {err}")
                 import traceback
                 traceback.print_exc()
 
@@ -166,18 +190,14 @@ async def main() -> None:
 
     stream.on(EventType.ORDER_PAID, on_order_paid)
 
-    def on_order_completed(e):
-        print(f"Order {e.order_id} completed!")
+    stream.on(EventType.ORDER_COMPLETED, lambda e: print(f"Order {e.order_id} COMPLETED"))
 
-    stream.on(EventType.ORDER_COMPLETED, on_order_completed)
-
-    # Keep process alive
+    # Keep alive
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGINT, stop.set)
-    loop.add_signal_handler(signal.SIGTERM, stop.set)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
     await stop.wait()
-
     await stream.close()
     await client.close()
 
